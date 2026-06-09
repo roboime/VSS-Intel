@@ -1,0 +1,25 @@
+fira_bridge:
+  ros__parameters:
+    team_color: "blue"
+    vision_ip: "127.0.0.1"
+    vision_port: 10002
+    command_ip: "127.0.0.1"
+    command_port: 20011
+
+ekf:
+  ros__parameters:
+    field_length: 1.50
+    field_width: 1.30
+    ball_friction: 0.05
+    wall_restitution: 0.8
+    process_noise_pos: 0.001
+    process_noise_vel: 0.05
+    measure_noise: 0.002
+    max_innovation: 0.30
+
+strategy:
+  ros__parameters:
+    team_color: "blue"
+    attack_dir: 1
+    control_hz: 60.0
+    wheel_base: 0.075
