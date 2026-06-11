@@ -55,7 +55,7 @@ public:
             std::bind(&FIRABridgeNode::readVision, this));
 
         auto gs       = vss_msgs::msg::GameState();
-        gs.situation  = "normal_game";
+        gs.situation  = game_situation_;
         gs.attack_dir = is_blue_team_ ? 1 : -1;
         pub_game_state_->publish(gs);
 
@@ -84,6 +84,7 @@ private:
     sockaddr_in cmd_addr_{};
     bool        is_blue_team_;
     std::string team_color_;
+	std::string game_situation_ = "normal_game";
 
     static constexpr size_t BUFFER_SIZE = 65536;
     std::array<char, BUFFER_SIZE> buf_{};
@@ -153,6 +154,12 @@ private:
     }
     
     if (n <= 0) return;
+		
+    // Publica o GameState continuamente a cada frame recebido
+    auto gs       = vss_msgs::msg::GameState();
+    gs.situation  = game_situation_;
+    gs.attack_dir = is_blue_team_ ? 1 : -1;
+    pub_game_state_->publish(gs);
 
     fira_message::sim_to_ref::Environment env;
     if (!env.ParseFromArray(buf_.data(), static_cast<int>(n))) {
