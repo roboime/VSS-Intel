@@ -51,6 +51,12 @@ public:
     // Nome para logs e debug
     virtual std::string name() const = 0;
 
+    // Retorna o nome do papel atual do robô i
+    virtual std::string roleName(int i) const {
+        if (i >= 0 && i < 3 && roles_[i]) return roles_[i]->name();
+        return "None";
+    }
+
     // Prioridade — plays com maior prioridade são testados primeiro
     // Override para ajustar (default = 0)
     virtual int priority() const { return 0; }
@@ -147,6 +153,10 @@ public:
 
     std::string activePlayName() const {
         return active_play_ ? active_play_->name() : "none";
+    }
+
+    std::string activeRoleName(int i) const {
+        return active_play_ ? active_play_->roleName(i) : "none";
     }
 
 private:

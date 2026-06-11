@@ -18,9 +18,9 @@ namespace vss {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct RotateToAngleParams {
-    double kp_angular         = 6.0;
+    double kp_angular         = 6.5;   // Ajustado para 6.5 (valor intermediário estável)
     double arrival_threshold  = 0.08;  // rad (~4.6°)
-    double max_omega          = 8.0;   // rad/s
+    double max_omega          = 10.0;  // rad/s (Ajustado para 10.0)
     double wheel_base         = 0.075;
 };
 

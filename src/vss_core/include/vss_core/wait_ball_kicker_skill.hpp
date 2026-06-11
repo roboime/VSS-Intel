@@ -23,9 +23,9 @@ namespace vss {
 struct WaitBallKickerParams {
     double intercept_dist      = 0.08;   // dist. para considerar "bola chegou"
     double position_tolerance  = 0.05;   // tolerância de posicionamento na traj.
-    double kp_linear           = 3.0;
-    double kp_angular          = 5.0;
-    double max_linear_speed    = 1.0;
+    double kp_linear           = 3.5;    // Ajustado para 3.5 (valor intermediário)
+    double kp_angular          = 5.5;    // Ajustado para 5.5 (valor intermediário)
+    double max_linear_speed    = 1.8;    // m/s (Ajustado para 1.8)
     double wheel_base          = 0.075;
     // Lookahead: quanto tempo na frente prediz a trajetória da bola
     double lookahead_seconds   = 0.3;
@@ -102,6 +102,9 @@ public:
             double ang_to_ball = std::atan2(ball.y - robot.y, ball.x - robot.x);
             double ang_err     = normalizeAngle(ang_to_ball - robot.theta);
             double omega = params_.kp_angular * ang_err;
+            if (std::abs(ang_err) < 0.05) {
+                omega = 0.0;
+            }
             return clampCommand(RobotCommand::fromVW(robot.id, 0.0, omega,
                                                       params_.wheel_base));
         }
@@ -110,7 +113,14 @@ public:
         double align     = std::max(0.0, std::cos(angle_err));
         double v = std::clamp(params_.kp_linear * dist * align,
                               -params_.max_linear_speed, params_.max_linear_speed);
+        
+        // Desvio de obstáculos e prevenção de colisões
+        v = avoidCollisions(robot, ctx, v);
+
         double omega = params_.kp_angular * angle_err;
+        if (std::abs(angle_err) < 0.05) {
+            omega = 0.0;
+        }
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));

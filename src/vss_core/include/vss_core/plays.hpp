@@ -72,12 +72,13 @@ static uint8_t middleRobot(const GameContext& ctx) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  NormalGamePlayVSS  —  fallback de jogo normal
 //
-//  Atribuição dinâmica baseada em posição:
-//    · Robô mais perto da bola   → NormalAttackerRoleVSS
-//    · Robô do meio              → DefenderAreaRoleVSS
+//  Atribuição DINÂMICA baseada em posição (reavaliada a cada frame):
+//    · Robô mais perto da bola   → NormalAttackerRoleVSS (agressivo)
+//    · Robô do meio              → SupportAttackerRoleVSS (suporte, não fogo amigo)
 //    · Robô mais longe da bola   → KeeperRoleVSS
 //
-//  Equivale ao NormalGamePlayVSS_class do LabVIEW
+//  A reavaliação dinâmica garante que se o goleiro está mais próximo da bola
+//  (bola no nosso gol), ele se torna temporariamente o atacante.
 // ─────────────────────────────────────────────────────────────────────────────
 class NormalGamePlayVSS final : public Play {
 public:
@@ -86,30 +87,40 @@ public:
     }
 
     void init(const GameContext& ctx) override {
-        uint8_t atk = closestToBall(ctx);
-        uint8_t gk  = farthestFromBall(ctx);
-        uint8_t def = middleRobot(ctx);
+        // Inicializa com base na distância atual
+        reassignIfNeeded(ctx);
+    }
 
-        assignRoles(
-            makeRole(0, atk, def, gk),
-            makeRole(1, atk, def, gk),
-            makeRole(2, atk, def, gk),
-            ctx
-        );
+    std::array<RobotCommand, 3> execute(const GameContext& ctx) override {
+        // REATRIBUI PAPÉIS A CADA FRAME baseado em distâncias atuais
+        reassignIfNeeded(ctx);
+        return Play::execute(ctx);
     }
 
     std::string name() const override { return "NormalGamePlayVSS"; }
     int priority() const override { return 0; }
 
 private:
-    std::shared_ptr<Role> makeRole(uint8_t i,
-                                    uint8_t atk,
-                                    uint8_t def,
-                                    uint8_t gk) const
-    {
-        if (i == atk) return std::make_shared<NormalAttackerRoleVSS>(i);
-        if (i == gk)  return std::make_shared<KeeperRoleVSS>(i);
-        return std::make_shared<DefenderAreaRoleVSS>(i);
+    uint8_t last_atk_ = 255;
+    uint8_t last_gk_  = 255;
+    uint8_t last_def_ = 255;
+
+    void reassignIfNeeded(const GameContext& ctx) {
+        uint8_t atk = closestToBall(ctx);
+        uint8_t gk  = farthestFromBall(ctx);
+        uint8_t def = middleRobot(ctx);
+
+        // Reatribui apenas se os papéis mudaram (evita reset desnecessário)
+        if (atk == last_atk_ && gk == last_gk_ && def == last_def_) return;
+        last_atk_ = atk; last_gk_ = gk; last_def_ = def;
+
+        std::array<std::shared_ptr<Role>, 3> r;
+        for (uint8_t i = 0; i < 3; ++i) {
+            if (i == atk) r[i] = std::make_shared<NormalAttackerRoleVSS>(i);
+            else if (i == gk)  r[i] = std::make_shared<KeeperRoleVSS>(i);
+            else r[i] = std::make_shared<SupportAttackerRoleVSS>(i);
+        }
+        assignRoles(r[0], r[1], r[2], ctx);
     }
 };
 
@@ -117,12 +128,10 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 //  NormalDefensivePlay  —  jogo normal com bola no nosso campo
 //
-//  Quando a bola está no nosso lado:
+//  Atribuição DINÂMICA (reavaliada a cada frame):
 //    · Robô mais perto da bola   → BallChallengerAttackerRoleVSS (pressão)
 //    · Robô do meio              → DefenderAreaRoleVSS (bloqueia linha)
 //    · Robô mais longe           → KeeperRoleVSS
-//
-//  Equivale ao NormalDefensivePlay_class do LabVIEW
 // ─────────────────────────────────────────────────────────────────────────────
 class NormalDefensivePlay final : public Play {
 public:
@@ -132,9 +141,28 @@ public:
     }
 
     void init(const GameContext& ctx) override {
+        reassignIfNeeded(ctx);
+    }
+
+    std::array<RobotCommand, 3> execute(const GameContext& ctx) override {
+        reassignIfNeeded(ctx);
+        return Play::execute(ctx);
+    }
+
+    std::string name() const override { return "NormalDefensivePlay"; }
+    int priority() const override { return 10; }
+
+private:
+    uint8_t last_atk_ = 255;
+    uint8_t last_gk_  = 255;
+
+    void reassignIfNeeded(const GameContext& ctx) {
         uint8_t atk = closestToBall(ctx);
         uint8_t gk  = farthestFromBall(ctx);
         uint8_t def = middleRobot(ctx);
+
+        if (atk == last_atk_ && gk == last_gk_) return;
+        last_atk_ = atk; last_gk_ = gk;
 
         std::array<std::shared_ptr<Role>, 3> r;
         for (uint8_t i = 0; i < 3; ++i) {
@@ -144,21 +172,19 @@ public:
         }
         assignRoles(r[0], r[1], r[2], ctx);
     }
-
-    std::string name() const override { return "NormalDefensivePlay"; }
-    int priority() const override { return 10; }
 };
 
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  OffensivePlay  —  bola no campo adversário
 //
-//  Quando a bola está no lado deles:
+//  Atribuição DINÂMICA (reavaliada a cada frame):
 //    · Robô mais perto da bola   → AttackerAimGoalRoleVSS (mira e chuta)
-//    · Robô do meio              → NormalAttackerRoleVSS  (pressão)
+//    · Robô do meio              → SupportAttackerRoleVSS (posição, NÃO fogo amigo)
 //    · Robô mais longe           → KeeperRoleVSS
 //
-//  Equivale ao OffensivePlay_class do LabVIEW
+//  CRÍTICO: O robô do meio usa SupportAttackerRoleVSS, não NormalAttackerRoleVSS,
+//  para evitar que dois robôs corram para a mesma bola simultaneamente.
 // ─────────────────────────────────────────────────────────────────────────────
 class OffensivePlay final : public Play {
 public:
@@ -168,21 +194,37 @@ public:
     }
 
     void init(const GameContext& ctx) override {
+        reassignIfNeeded(ctx);
+    }
+
+    std::array<RobotCommand, 3> execute(const GameContext& ctx) override {
+        reassignIfNeeded(ctx);
+        return Play::execute(ctx);
+    }
+
+    std::string name() const override { return "OffensivePlay"; }
+    int priority() const override { return 10; }
+
+private:
+    uint8_t last_atk_ = 255;
+    uint8_t last_gk_  = 255;
+
+    void reassignIfNeeded(const GameContext& ctx) {
         uint8_t atk = closestToBall(ctx);
         uint8_t gk  = farthestFromBall(ctx);
         uint8_t sup = middleRobot(ctx);
+
+        if (atk == last_atk_ && gk == last_gk_) return;
+        last_atk_ = atk; last_gk_ = gk;
 
         std::array<std::shared_ptr<Role>, 3> r;
         for (uint8_t i = 0; i < 3; ++i) {
             if (i == atk) r[i] = std::make_shared<AttackerAimGoalRoleVSS>(i);
             else if (i == gk) r[i] = std::make_shared<KeeperRoleVSS>(i);
-            else r[i] = std::make_shared<NormalAttackerRoleVSS>(i);
+            else r[i] = std::make_shared<SupportAttackerRoleVSS>(i);
         }
         assignRoles(r[0], r[1], r[2], ctx);
     }
-
-    std::string name() const override { return "OffensivePlay"; }
-    int priority() const override { return 10; }
 };
 
 

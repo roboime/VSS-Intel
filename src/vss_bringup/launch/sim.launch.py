@@ -7,7 +7,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
 
     # ── Argumentos configuráveis na linha de comando ──────────────────────
-       # Uso: ros2 launch vss_bringup sim.launch.py team:=yellow attack_dir:=-1
+    # Uso: ros2 launch vss_bringup sim.launch.py team:=yellow attack_dir:=-1
     team_arg = DeclareLaunchArgument(
         'team',
         default_value='blue',

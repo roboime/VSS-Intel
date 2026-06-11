@@ -83,11 +83,11 @@ public:
         pub_commands_ = create_publisher<vss_msgs::msg::RobotCommandArray>(
             "/robot_commands", 10);
 
-        // ── Timer de controle ─────────────────────────────────────────────
-        auto period_ms = std::chrono::milliseconds(
-            static_cast<int>(1000.0 / hz));
+        // ── Timer Fixo de 60Hz ────────────────────────────────────────────
+        // Executa a 60Hz fixos (16ms) para sincronizar melhor com o simulador a 59 FPS
+        // e evitar engasgos do executor no modo Data-Driven.
         timer_ = create_wall_timer(
-            period_ms,
+            std::chrono::milliseconds(16),
             std::bind(&StrategyNode::controlLoop, this));
 
         RCLCPP_INFO(get_logger(),
@@ -138,14 +138,17 @@ private:
         }
         pub_commands_->publish(out_msg);
 
-        // ── Log periódico (a cada 180 frames ≈ 3s) ───────────────────────
-        if (frame_count_ % 180 == 0) {
-            RCLCPP_INFO(get_logger(),
-                "Play ativo: %s | Bola: (%.2f, %.2f) | Frame: %u",
-                playbook_.activePlayName().c_str(),
-                ctx_.ball.x, ctx_.ball.y,
-                frame_count_);
-        }
+        // ── Log de Telemetria (Restaurado com Throttle de 200ms) ───────────
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 200,
+            "Telemetria VSS | Play: %s | Bola: (X:%.2f, Y:%.2f)\n"
+            "  -> R0: %s\n"
+            "  -> R1: %s\n"
+            "  -> R2: %s",
+            playbook_.activePlayName().c_str(),
+            ctx_.ball.x, ctx_.ball.y,
+            playbook_.activeRoleName(0).c_str(),
+            playbook_.activeRoleName(1).c_str(),
+            playbook_.activeRoleName(2).c_str());
     }
 
     // ─────────────────────────────────────────────────────────────────────

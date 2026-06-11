@@ -195,8 +195,6 @@ private:
             if (innov_dist > 0.5) {
                 x_[0] = msg->x;  x_[1] = msg->y;
                 x_[2] = msg->vx; x_[3] = msg->vy;
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
-                    "EKF reinicializado — salto de %.3f m", innov_dist);
             }
             publishState();
             return;

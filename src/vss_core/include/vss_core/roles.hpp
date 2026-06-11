@@ -19,8 +19,6 @@ namespace vss {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DefendGoalTactic  —  usada pelo KeeperRoleVSS
-//  LabVIEW: KeeperRole → Tacticbook → DefendGoalTactic → States
-//
 //  Lógica: goleiro se posiciona na linha do gol, movendo-se lateralmente
 //  para interceptar a trajetória da bola. Não sai da área do goleiro.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,7 +32,8 @@ public:
                          const GameContext& ctx) override
     {
         // Posição base do goleiro: na linha do gol, lado de defesa
-        double goal_x = -ctx.attack_dir * (ctx.field.max_x() - 0.05);
+        // Margem de recuo aumentada para 0.08m para evitar impactos com as traves/fundo
+        double goal_x = -ctx.attack_dir * (ctx.field.max_x() - 0.08);
 
         // Projeta a bola na linha do goleiro para calcular target_y
         // Se a bola vem em direção ao nosso gol, intercepta na linha
@@ -60,15 +59,10 @@ public:
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DefendAreaTactic  —  usada pelo DefenderAreaRoleVSS
-//  LabVIEW: DefenderAreaRole → Tacticbook → DefendAreaTactic → States
-//  Parâmetro: Number of Defenders Without Duelist (default = 0 no LabVIEW)
-//
-//  Lógica: defensor se posiciona entre a bola e o nosso gol,
-//  a uma distância calculada. Se a bola está muito perto, vai buscar.
+//  Lógica: defensor se posiciona entre a bola e o nosso gol.
 // ─────────────────────────────────────────────────────────────────────────────
 class DefendAreaTactic final : public Tactic {
 public:
-    // num_defenders_without_duelist: parâmetro do LabVIEW (default 0)
     explicit DefendAreaTactic(int num_defenders = 0)
         : num_defenders_(num_defenders) {}
 
@@ -85,7 +79,6 @@ public:
         double dist_ball_goal = std::hypot(dx_ball_goal, dy_ball_goal);
 
         // Posição de defesa: entre a bola e o gol, a DEFEND_DIST metros do gol
-        // Ajuste por número de defensores (LabVIEW: Number of Defenders)
         double defend_dist = 0.20 + num_defenders_ * 0.05;
         defend_dist = std::min(defend_dist, dist_ball_goal * 0.6);
 
@@ -93,12 +86,13 @@ public:
         double target_y = our_goal.y + (dy_ball_goal / dist_ball_goal) * (-defend_dist);
 
         // Clamp dentro do campo
+        // Margem de segurança aumentada para 0.08m para evitar colisões com as paredes
         target_x = std::clamp(target_x,
-                               ctx.field.min_x() + 0.05f,
-                               ctx.field.max_x() - 0.05f);
+                               ctx.field.min_x() + 0.08,
+                               ctx.field.max_x() - 0.08);
         target_y = std::clamp(target_y,
-                               ctx.field.min_y() + 0.05f,
-                               ctx.field.max_y() - 0.05f);
+                               ctx.field.min_y() + 0.08,
+                               ctx.field.max_y() - 0.08);
 
         GoToPositionSkill gtp(target_x, target_y);
         return gtp.execute(robot, ctx);
@@ -106,6 +100,131 @@ public:
 
 private:
     int num_defenders_;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AggressiveGoToBallSkill
+//
+//  Igual ao GoToBallSkill mas SEM a proteção da área adversária.
+//  O atacante designado DEVE poder entrar na área para empurrar a bola.
+// ─────────────────────────────────────────────────────────────────────────────
+class AggressiveGoToBallSkill final : public Skill {
+public:
+    RobotCommand execute(const RobotState& robot,
+                         const GameContext& ctx) override
+    {
+        // Destino direto: bola (sem offset de área adversária)
+        double target_x = ctx.ball.x;
+        double target_y = ctx.ball.y;
+
+        // Clamp mínimo dentro do campo (apenas paredes)
+        const double m = 0.04;
+        target_x = std::clamp(target_x, ctx.field.min_x()+m, ctx.field.max_x()-m);
+        target_y = std::clamp(target_y, ctx.field.min_y()+m, ctx.field.max_y()-m);
+
+        double dx   = target_x - robot.x;
+        double dy   = target_y - robot.y;
+        double dist = std::hypot(dx, dy);
+
+        if (dist < 0.06) {
+            finished_ = true;
+            return RobotCommand::stop(robot.id);
+        }
+
+        double angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
+        double align     = std::max(0.0, std::cos(angle_err));
+
+        // Ganho maior para o atacante ser agressivo
+        double v = std::clamp(4.0 * dist * align, -2.2, 2.2);
+
+        // Zona morta angular
+        double omega = (std::abs(angle_err) < 0.05) ? 0.0 : 6.0 * angle_err;
+
+        // Desvio de colisões com aliados (não adversários — atacante empurra adversário)
+        for (const auto& ally : ctx.allies) {
+            if (ally.id == robot.id || !ally.valid) continue;
+            double adx = ally.x - robot.x;
+            double ady = ally.y - robot.y;
+            double adist = std::hypot(adx, ady);
+            if (adist < 0.12) {
+                double ang_to_ally = std::atan2(ady, adx);
+                double ang_diff = std::abs(normalizeAngle(ang_to_ally - robot.theta));
+                if (ang_diff < M_PI / 4.0) {
+                    double scale = (adist - 0.075) / (0.12 - 0.075);
+                    v *= std::clamp(scale, 0.0, 1.0);
+                }
+            }
+        }
+
+        return clampCommand(RobotCommand::fromVW(robot.id, v, omega, 0.075));
+    }
+
+    std::string name() const override { return "AggressiveGoToBallSkill"; }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AggressivePushTactic  —  vai direto na bola sem hesitar, para agressão
+//  Sequência: AggressiveGoToBallSkill → KickSkill (loop)
+// ─────────────────────────────────────────────────────────────────────────────
+class AggressivePushTactic final : public Tactic {
+public:
+    std::string name() const override { return "AggressivePushTactic"; }
+    bool isFinished() const override { return false; }  // loop infinito
+
+    AggressivePushTactic() {
+        addSkill<AggressiveGoToBallSkill>();
+        addSkill<KickSkill>();
+    }
+
+    RobotCommand execute(const RobotState& robot,
+                         const GameContext& ctx) override
+    {
+        auto cmd = Tactic::execute(robot, ctx);
+        if (tactic_finished_) {
+            tactic_finished_   = false;
+            current_skill_idx_ = 0;
+            skills_[0]->init(robot, ctx);
+        }
+        return cmd;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SupportPositionTactic  —  zagueiro se posiciona a meio-campo em apoio
+//
+//  Em vez de perseguir a bola (causando fogo amigo), o zagueiro/suporte
+//  se posiciona estrategicamente entre a bola e o nosso gol,
+//  pronto para defender mas também para receber a bola.
+// ─────────────────────────────────────────────────────────────────────────────
+class SupportPositionTactic final : public Tactic {
+public:
+    std::string name() const override { return "SupportPositionTactic"; }
+    bool isFinished() const override { return false; }
+
+    RobotCommand execute(const RobotState& robot,
+                         const GameContext& ctx) override
+    {
+        // Posição de suporte: atrás da bola (em relação ao nosso gol),
+        // a uma distância lateral de 0.20m para não bloquear o atacante
+        double our_goal_x = -ctx.attack_dir * ctx.field.max_x();
+
+        // Fica entre a bola e o gol próprio, a ~35% da distância do gol
+        double support_x = ctx.ball.x * 0.35 + our_goal_x * 0.65;
+
+        // Offset lateral para não cobrir o mesmo corredor do atacante
+        double lateral_offset = (ctx.ball.y > 0.0) ? -0.18 : 0.18;
+        double support_y = std::clamp(ctx.ball.y + lateral_offset,
+                                      ctx.field.min_y() + 0.10,
+                                      ctx.field.max_y() - 0.10);
+
+        // Clamp no eixo X: o suporte não vai para o campo adversário
+        support_x = std::clamp(support_x,
+                                ctx.field.min_x() + 0.08,
+                                0.0);  // não passa do meio campo
+
+        GoToPositionSkill gtp(support_x, support_y);
+        return gtp.execute(robot, ctx);
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -145,11 +264,6 @@ public:
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KeeperRoleVSS
-//
-//  LabVIEW (imagem 2):
-//    Tacticbook com UMA tática: DefendGoalTactic
-//    Sem condições de troca — sempre DefendGoalTactic
-//    First call? → inicializa tacticbook com tactic_index = 0
 // ─────────────────────────────────────────────────────────────────────────────
 class KeeperRoleVSS final : public Role {
 public:
@@ -168,15 +282,9 @@ protected:
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DefenderAreaRoleVSS
-//
-//  LabVIEW (imagem 5):
-//    Tacticbook com UMA tática: DefendAreaTactic
-//    Parâmetro: Number of Defenders Without Duelist = 0 (default do LabVIEW)
-//    Sem condições de troca — sempre DefendAreaTactic
 // ─────────────────────────────────────────────────────────────────────────────
 class DefenderAreaRoleVSS final : public Role {
 public:
-    // num_defenders: "Number of Defenders Without Duelist" do LabVIEW
     explicit DefenderAreaRoleVSS(uint8_t id, int num_defenders = 0)
         : Role(id), num_defenders_(num_defenders) {}
 
@@ -197,12 +305,9 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 //  NormalAttackerRoleVSS
 //
-//  LabVIEW: NormalAttackerRoleVSS — atacante padrão do jogo normal
-//  Lógica de seleção de tática:
-//    · Longe da bola   → GoToBallSkill (aproxima)
-//    · Perto da bola + mal alinhado → RotateToAngleSkill (alinha)
-//    · Perto da bola + alinhado     → KickSkill (chuta)
-//  Loop: depois do chute, volta para GoToBall
+//  CORRIGIDO: Atacante agressivo que vai direto na bola e entra na área.
+//  Usa AggressivePushTactic para não ser bloqueado pela proteção de área.
+//  A atribuição de papel (atacante) é feita pelo Play baseado em distância.
 // ─────────────────────────────────────────────────────────────────────────────
 class NormalAttackerRoleVSS final : public Role {
 public:
@@ -213,30 +318,39 @@ protected:
     std::shared_ptr<Tactic> selectTactic(const RobotState& robot,
                                           const GameContext& ctx) override
     {
-        double dist = distToBall(robot, ctx);
-
-        // Longe da bola → vai buscar
-        if (dist > BALL_NEAR_THRESHOLD) {
-            return std::make_shared<SingleSkillTactic>(
-                std::make_shared<GoToBallSkill>());
-        }
-
-        // Perto da bola → ciclo de chute
-        return std::make_shared<GoToBallAndKickTactic>();
+        (void)robot; (void)ctx;
+        // Atacante sempre usa a tática agressiva: vai direto na bola, entra na área
+        return std::make_shared<AggressivePushTactic>();
     }
+};
 
-private:
-    static constexpr double BALL_NEAR_THRESHOLD = 0.25;  // metros
+// ─────────────────────────────────────────────────────────────────────────────
+//  SupportAttackerRoleVSS
+//
+//  NOVO: Robô de suporte/zagueiro ofensivo.
+//  Em vez de perseguir a bola (causando colisões com o atacante principal),
+//  este robô se posiciona estrategicamente para receber passes e cobrir
+//  o espaço. Evita o "fogo amigo" onde dois robôs vão na mesma bola.
+// ─────────────────────────────────────────────────────────────────────────────
+class SupportAttackerRoleVSS final : public Role {
+public:
+    explicit SupportAttackerRoleVSS(uint8_t id) : Role(id) {}
+    std::string name() const override { return "SupportAttackerRoleVSS"; }
+
+protected:
+    std::shared_ptr<Tactic> selectTactic(const RobotState& robot,
+                                          const GameContext& ctx) override
+    {
+        (void)robot; (void)ctx;
+        return std::make_shared<SupportPositionTactic>();
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AttackerAimGoalRoleVSS
 //
-//  LabVIEW: AttackerAimGoalRoleVSS — atacante que mira o gol antes de chutar
-//  Diferença do NormalAttacker: adiciona fase de alinhamento explícita
-//    1. GoToBall (aproxima pela traseira da bola em relação ao gol)
-//    2. RotateToAngle (alinha para o gol)
-//    3. Kick (chuta)
+//  Atacante que mira o gol antes de chutar.
+//  Diferença do NormalAttacker: adiciona fase de alinhamento explícita.
 // ─────────────────────────────────────────────────────────────────────────────
 class AimGoalTactic final : public Tactic {
 public:
@@ -244,7 +358,7 @@ public:
     bool isFinished() const override { return false; }
 
     AimGoalTactic() {
-        addSkill<GoToBallSkill>();
+        addSkill<AggressiveGoToBallSkill>();
         addSkill<RotateToAngleSkill>(RotateToAngleSkill::towardGoal());
         addSkill<KickSkill>();
     }
@@ -279,10 +393,8 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 //  BallChallengerAttackerRoleVSS
 //
-//  LabVIEW: BallChallengerAttackerRoleVSS
 //  Atacante agressivo: sempre vai para a bola independente de distância.
-//  Sem fase de alinhamento — chuta de onde estiver.
-//  Usado quando o time precisa pressionar e não tem tempo para alinhar.
+//  Usado quando o time precisa pressionar.
 // ─────────────────────────────────────────────────────────────────────────────
 class BallChallengerAttackerRoleVSS final : public Role {
 public:
@@ -295,23 +407,22 @@ protected:
     {
         (void)robot; (void)ctx;
         // Sempre ciclo agressivo GoToBall → Kick sem espera
-        return std::make_shared<GoToBallAndKickTactic>();
+        return std::make_shared<AggressivePushTactic>();
     }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GoAndKickRoleVSS
 //
-//  LabVIEW: GoAndKickRoleVSS — vai até a bola e chuta uma vez (não loop)
-//  Usado em set-pieces: kickoff, freeball, direct kick
-//  Executa GoToBall → Kick uma única vez e finaliza
+//  Vai até a bola e chuta uma vez (não loop).
+//  Usado em set-pieces: kickoff, freeball, direct kick.
 // ─────────────────────────────────────────────────────────────────────────────
 class GoAndKickOneTimeTactic final : public Tactic {
 public:
     std::string name() const override { return "GoAndKickOneTimeTactic"; }
 
     GoAndKickOneTimeTactic() {
-        addSkill<GoToBallSkill>();
+        addSkill<AggressiveGoToBallSkill>();
         addSkill<KickSkill>();
     }
     // isFinished() da Tactic base retorna true após KickSkill terminar
@@ -334,9 +445,8 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 //  GoalKickKeeperRoleVSS
 //
-//  LabVIEW: GoalKickKeeperRoleVSS — goleiro executa o tiro de meta
-//  Sai da posição de goleiro, vai até a bola e chuta uma vez,
-//  depois retorna para DefendGoalTactic
+//  Goleiro executa o tiro de meta.
+//  Sai da posição de goleiro, vai até a bola e chuta uma vez.
 // ─────────────────────────────────────────────────────────────────────────────
 class GoalKickKeeperRoleVSS final : public Role {
 public:

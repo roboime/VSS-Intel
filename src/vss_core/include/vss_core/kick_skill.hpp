@@ -51,7 +51,7 @@ struct KickSkillParams {
 
     // Velocidade máxima de chute (LabVIEW: vx_desired = 1000)
     // Normalizado para m/s do FIRASim
-    double kick_speed = 1.5;              // m/s (velocidade máxima das rodas)
+    double kick_speed = 2.5;              // m/s (velocidade máxima das rodas, ajustado para 2.5)
 
     // Fator de escala do impulso (LabVIEW: 0.5 × 200)
     double kick_impulse_factor = 0.5;
@@ -61,7 +61,7 @@ struct KickSkillParams {
     double alignment_threshold_rad = 0.15;  // ~8.6 graus
 
     // Ganho de rotação durante a fase ALIGN
-    double kp_rotation = 5.0;
+    double kp_rotation = 6.0;             // Ajustado para 6.0 (intermediário estável)
 
     // Distância para considerar que o chute foi executado
     double kick_done_dist = 0.06;   // metros da bola
@@ -210,6 +210,11 @@ private:
         v = std::min(v, params_.kick_speed);
 
         double omega = 3.0 * angle_err;  // correção suave
+
+        // Zona morta para o erro angular durante a arrancada
+        if (std::abs(angle_err) < 0.05) {
+            omega = 0.0;
+        }
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));

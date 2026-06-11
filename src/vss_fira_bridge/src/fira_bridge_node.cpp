@@ -84,7 +84,7 @@ private:
     sockaddr_in cmd_addr_{};
     bool        is_blue_team_;
     std::string team_color_;
-	std::string game_situation_ = "normal_game";
+    std::string game_situation_ = "normal_game";
 
     static constexpr size_t BUFFER_SIZE = 65536;
     std::array<char, BUFFER_SIZE> buf_{};
@@ -149,12 +149,11 @@ private:
     ssize_t n = recv(vision_sock_, buf_.data(), buf_.size(), 0);
     
     if (n > 0) {
-        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
-            "Recebeu %ld bytes do FIRASim", n);
+        // Log omitido para otimizar velocidade
     }
     
     if (n <= 0) return;
-		
+
     // Publica o GameState continuamente a cada frame recebido
     auto gs       = vss_msgs::msg::GameState();
     gs.situation  = game_situation_;
@@ -163,8 +162,7 @@ private:
 
     fira_message::sim_to_ref::Environment env;
     if (!env.ParseFromArray(buf_.data(), static_cast<int>(n))) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-            "Falha ao parsear Environment proto");
+        // Falha no parse, ignora frame
         return;
     }
     const auto& frame = env.frame();
@@ -207,7 +205,6 @@ private:
 
         std::string serialized;
         if (!packet.SerializeToString(&serialized)) {
-            RCLCPP_WARN(get_logger(), "Falha ao serializar comando");
             return;
         }
 

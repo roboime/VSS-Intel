@@ -9,13 +9,13 @@ namespace vss {
 
 // Params fora da classe para evitar problema de default argument
 struct GoToBallSkillParams {
-    double kp_linear         = 2.5;
-    double kp_angular        = 4.0;
+    double kp_linear         = 3.5;   // Ajustado para 3.5 (valor intermediário estável)
+    double kp_angular        = 5.0;   // Ajustado para 5.0 (valor intermediário estável)
     double arrival_threshold = 0.08;  // metros
     double ball_offset       = 0.04;  // metros atrás da bola em dir. ao gol
     double area_danger_dist  = 0.12;  // dist. "perto da área" (LabVIEW)
     double area_exit_offset  = 0.12;  // 120mm → LabVIEW "x + 120"
-    double max_linear_speed  = 1.2;   // m/s
+    double max_linear_speed  = 2.2;   // m/s (Ajustado para 2.2 m/s)
     double wheel_base        = 0.075; // metros entre rodas
 };
 
@@ -57,7 +57,7 @@ public:
         if (should_stop) return RobotCommand::stop(robot.id);
 
         // ── 3. Clamp dentro do campo ──────────────────────────────────────
-        const double m = 0.05;
+        const double m = 0.08; // Aumentado de 0.05 para 0.08 para evitar colisões com as paredes
         target_x = std::clamp(target_x, ctx.field.min_x()+m, ctx.field.max_x()-m);
         target_y = std::clamp(target_y, ctx.field.min_y()+m, ctx.field.max_y()-m);
 
@@ -80,7 +80,16 @@ public:
         double v     = std::clamp(params_.kp_linear * dist * align,
                                   -params_.max_linear_speed,
                                    params_.max_linear_speed);
+        
+        // Desvio de obstáculos e prevenção de colisões
+        v = avoidCollisions(robot, ctx, v);
+
         double omega = params_.kp_angular * angle_err;
+
+        // Zona morta para o erro angular para evitar tremedeira/oscilação residual
+        if (std::abs(angle_err) < 0.05) {
+            omega = 0.0;
+        }
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));

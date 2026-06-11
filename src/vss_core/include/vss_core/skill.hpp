@@ -49,8 +49,8 @@ protected:
     bool finished_ = false;
 
     // Helper: limita velocidade das rodas aos limites físicos do robô VSS
-    // Valor típico para robôs VSS: ~1.5 m/s por roda
-    static constexpr double MAX_WHEEL_SPEED = 1.5;
+    // Valor típico para robôs VSS: ~1.5 m/s por roda (ajustado para 2.5 m/s para velocidade máxima rápida e estável)
+    static constexpr double MAX_WHEEL_SPEED = 2.5;
 
     RobotCommand clampCommand(RobotCommand cmd) const {
         cmd.wheel_left  = std::clamp(cmd.wheel_left,
@@ -58,6 +58,39 @@ protected:
         cmd.wheel_right = std::clamp(cmd.wheel_right,
                                      -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED);
         return cmd;
+    }
+
+    // Retorna a velocidade linear reduzida em caso de iminência de colisão com outros robôs
+    double avoidCollisions(const RobotState& robot, const GameContext& ctx, double v) const {
+        for (const auto& ally : ctx.allies) {
+            if (ally.id == robot.id || !ally.valid) continue;
+            double dx = ally.x - robot.x;
+            double dy = ally.y - robot.y;
+            double dist = std::hypot(dx, dy);
+            if (dist < 0.13) {
+                double ang_to_other = std::atan2(dy, dx);
+                double ang_diff = std::abs(normalizeAngle(ang_to_other - robot.theta));
+                if (ang_diff < M_PI / 4.0) { // Robô na frente (45 graus de abertura)
+                    double scale = (dist - 0.075) / (0.13 - 0.075);
+                    v *= std::clamp(scale, 0.0, 1.0);
+                }
+            }
+        }
+        for (const auto& enemy : ctx.enemies) {
+            if (!enemy.valid) continue;
+            double dx = enemy.x - robot.x;
+            double dy = enemy.y - robot.y;
+            double dist = std::hypot(dx, dy);
+            if (dist < 0.13) {
+                double ang_to_other = std::atan2(dy, dx);
+                double ang_diff = std::abs(normalizeAngle(ang_to_other - robot.theta));
+                if (ang_diff < M_PI / 4.0) {
+                    double scale = (dist - 0.075) / (0.13 - 0.075);
+                    v *= std::clamp(scale, 0.0, 1.0);
+                }
+            }
+        }
+        return v;
     }
 };
 

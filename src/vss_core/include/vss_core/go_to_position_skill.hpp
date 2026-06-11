@@ -19,10 +19,10 @@ namespace vss {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct GoToPositionParams {
-    double kp_linear          = 3.0;
-    double kp_angular         = 5.0;
+    double kp_linear          = 3.5;    // Ajustado para 3.5 (valor intermediário estável)
+    double kp_angular         = 5.5;    // Ajustado para 5.5 (valor intermediário estável)
     double arrival_threshold  = 0.06;   // metros
-    double max_linear_speed   = 1.3;    // m/s
+    double max_linear_speed   = 2.2;    // m/s (Ajustado para 2.2 m/s)
     double wheel_base         = 0.075;
     bool   stop_on_arrival    = true;
 };
@@ -72,7 +72,16 @@ public:
         double v = std::clamp(params_.kp_linear * dist * align,
                               -params_.max_linear_speed,
                                params_.max_linear_speed);
+        
+        // Desvio de obstáculos e prevenção de colisões
+        v = avoidCollisions(robot, ctx, v);
+
         double omega = params_.kp_angular * angle_err;
+        
+        // Zona morta para o erro angular para evitar tremedeira/oscilação residual
+        if (std::abs(angle_err) < 0.05) {
+            omega = 0.0;
+        }
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));
