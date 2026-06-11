@@ -7,9 +7,9 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
 
     # ── Argumentos configuráveis na linha de comando ──────────────────────
-    # Uso: ros2 launch vss_bringup sim.launch.py team_color:=yellow attack_dir:=-1
-    team_color_arg = DeclareLaunchArgument(
-        'team_color',
+       # Uso: ros2 launch vss_bringup sim.launch.py team:=yellow attack_dir:=-1
+    team_arg = DeclareLaunchArgument(
+        'team',
         default_value='blue',
         description='Cor do time: blue ou yellow'
     )
@@ -24,7 +24,7 @@ def generate_launch_description():
         description='Frequência do loop de controle (Hz)'
     )
 
-    team_color  = LaunchConfiguration('team_color')
+    team        = LaunchConfiguration('team')
     attack_dir  = LaunchConfiguration('attack_dir')
     control_hz  = LaunchConfiguration('control_hz')
 
@@ -46,7 +46,7 @@ def generate_launch_description():
         parameters=[
             params_file,
             {
-                'team_color':    team_color,
+                'team_color':    team,
                 'vision_ip':     '224.0.0.1',
                 'vision_port':   10002,
                 'referee_ip':    '224.0.0.1',
@@ -95,7 +95,7 @@ def generate_launch_description():
                 parameters=[
                     params_file,
                     {
-                        'team_color':  team_color,
+                        'team_color':  team,
                         'attack_dir':  attack_dir,
                         'control_hz':  control_hz,
                         'wheel_base':  0.075,
@@ -109,13 +109,13 @@ def generate_launch_description():
 
     return LaunchDescription([
         # Argumentos
-        team_color_arg,
+        team_arg,
         attack_dir_arg,
         hz_arg,
 
         # Info de inicialização
         LogInfo(msg='=== VSS_AI iniciando ==='),
-        LogInfo(msg=['Time: ', team_color, ' | Attack dir: ', attack_dir]),
+        LogInfo(msg=['Time: ', team, ' | Attack dir: ', attack_dir]),
 
         # Nós (bridge e EKF sobem juntos, strategy com delay)
         fira_bridge_node,
