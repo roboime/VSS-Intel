@@ -4,6 +4,7 @@
 #include "tactic.hpp"
 #include "go_to_ball_skill.hpp"
 #include "go_to_position_skill.hpp"
+#include "vector_attacker_skill.hpp"
 #include "kick_skill.hpp"
 #include "wait_ball_kicker_skill.hpp"
 #include "rotate_to_angle_skill.hpp"
@@ -47,8 +48,8 @@ public:
             }
         }
 
-        // Clamp: goleiro não sai da largura da área do gol
-        double max_y = ctx.field.goal_width / 2.0 + 0.05;
+        // Clamp: goleiro não sai estritamente da largura do gol (desconta 4cm do raio do robô)
+        double max_y = ctx.field.goal_width / 2.0 - 0.04;
         target_y = std::clamp(target_y, -max_y, max_y);
 
         // Vai para posição de defesa
@@ -126,19 +127,28 @@ public:
         double dy   = target_y - robot.y;
         double dist = std::hypot(dx, dy);
 
-        if (dist < 0.06) {
-            finished_ = true;
-            return RobotCommand::stop(robot.id);
+        // ── Singularidade Angular (atan2) ─────────────────────────────────
+        double angle_err = 0.0;
+        if (dist >= 0.02) {
+            angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
         }
 
-        double angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
+        // ── Zona Morta de Ângulo ──────────────────────────────────────────
+        if (std::abs(angle_err) < 0.05) {
+            angle_err = 0.0;
+        }
+
         double align     = std::max(0.0, std::cos(angle_err));
 
-        // Ganho maior para o atacante ser agressivo
-        double v = std::clamp(4.0 * dist * align, -2.2, 2.2);
+        // Ganho maior para o atacante ser agressivo (aumentado para 7.0)
+        double v = std::clamp(7.0 * dist * align, -2.2, 2.2);
 
-        // Zona morta angular
-        double omega = (std::abs(angle_err) < 0.05) ? 0.0 : 6.0 * angle_err;
+        // Garantir velocidade linear mínima na aproximação final para não desacelerar
+        if (dist < 0.15 && align > 0.5) {
+            v = std::max(v, 1.2 * align);
+        }
+
+        double omega = 6.0 * angle_err;
 
         // Desvio de colisões com aliados (não adversários — atacante empurra adversário)
         for (const auto& ally : ctx.allies) {
@@ -156,6 +166,18 @@ public:
             }
         }
 
+        // ── Zona Morta de Distância ───────────────────────────────────────
+        if (dist < 0.02) {
+            v = 0.0;
+            omega = 0.0;
+        }
+
+        // Fim da Skill: se chegou a menos de 4cm da bola, finaliza mas retorna o comando calculado
+        if (dist < 0.04) {
+            finished_ = true;
+            return clampCommand(RobotCommand::fromVW(robot.id, v, omega, 0.075));
+        }
+
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega, 0.075));
     }
 
@@ -163,29 +185,22 @@ public:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AggressivePushTactic  —  vai direto na bola sem hesitar, para agressão
-//  Sequência: AggressiveGoToBallSkill → KickSkill (loop)
+//  VectorAttackTactic  —  NOVA TÁTICA BASEADA EM VETORES
+//  Encapsula a nova VectorAttackerSkill que unifica aproximação e chute fluidamente.
 // ─────────────────────────────────────────────────────────────────────────────
-class AggressivePushTactic final : public Tactic {
+class VectorAttackTactic final : public Tactic {
 public:
-    std::string name() const override { return "AggressivePushTactic"; }
-    bool isFinished() const override { return false; }  // loop infinito
+    std::string name() const override { return "VectorAttackTactic"; }
+    bool isFinished() const override { return false; }  // Contínuo
 
-    AggressivePushTactic() {
-        addSkill<AggressiveGoToBallSkill>();
-        addSkill<KickSkill>();
+    VectorAttackTactic() {
+        addSkill<VectorAttackerSkill>();
     }
 
     RobotCommand execute(const RobotState& robot,
                          const GameContext& ctx) override
     {
-        auto cmd = Tactic::execute(robot, ctx);
-        if (tactic_finished_) {
-            tactic_finished_   = false;
-            current_skill_idx_ = 0;
-            skills_[0]->init(robot, ctx);
-        }
-        return cmd;
+        return Tactic::execute(robot, ctx);
     }
 };
 
@@ -204,25 +219,37 @@ public:
     RobotCommand execute(const RobotState& robot,
                          const GameContext& ctx) override
     {
-        // Posição de suporte: atrás da bola (em relação ao nosso gol),
-        // a uma distância lateral de 0.20m para não bloquear o atacante
-        double our_goal_x = -ctx.attack_dir * ctx.field.max_x();
+        double target_x, target_y;
 
-        // Fica entre a bola e o gol próprio, a ~35% da distância do gol
-        double support_x = ctx.ball.x * 0.35 + our_goal_x * 0.65;
+        // attack_dir = 1 (atacando para X positivo), -1 (atacando para X negativo)
+        // Se ball_relative_x > 0, bola está no meio-campo ofensivo.
+        double ball_relative_x = ctx.ball.x * ctx.attack_dir;
 
-        // Offset lateral para não cobrir o mesmo corredor do atacante
-        double lateral_offset = (ctx.ball.y > 0.0) ? -0.18 : 0.18;
-        double support_y = std::clamp(ctx.ball.y + lateral_offset,
-                                      ctx.field.min_y() + 0.10,
-                                      ctx.field.max_y() - 0.10);
+        if (ball_relative_x > 0.0) {
+            // ── FASE OFENSIVA ─────────────────────────────────────────────────
+            // Posiciona-se na intermediária (meio do campo ou um pouco avançado)
+            target_x = ctx.attack_dir * 0.10; // Pouco além do meio-campo
+            
+            // Fica no lado oposto (fraco) para receber sobras/cruzamentos
+            double lateral_offset = (ctx.ball.y > 0.0) ? -0.25 : 0.25;
+            target_y = ctx.ball.y + lateral_offset;
+        } else {
+            // ── FASE DEFENSIVA ────────────────────────────────────────────────
+            // Arma parede defensiva logo à frente da nossa área
+            double our_area_front = -ctx.attack_dir * (ctx.field.max_x() - ctx.field.area_length);
+            target_x = our_area_front + ctx.attack_dir * 0.12; // 12cm à frente da área
+            
+            // Bloqueia a linha de passe, acompanhando a bola em Y
+            // Escala ligeiramente para não abrir tanto o meio
+            target_y = ctx.ball.y * 0.85;
+        }
 
-        // Clamp no eixo X: o suporte não vai para o campo adversário
-        support_x = std::clamp(support_x,
-                                ctx.field.min_x() + 0.08,
-                                0.0);  // não passa do meio campo
+        // Clamp no eixo Y para evitar colar nas paredes laterais do campo
+        target_y = std::clamp(target_y,
+                               ctx.field.min_y() + 0.12,
+                               ctx.field.max_y() - 0.12);
 
-        GoToPositionSkill gtp(support_x, support_y);
+        GoToPositionSkill gtp(target_x, target_y);
         return gtp.execute(robot, ctx);
     }
 };
@@ -319,8 +346,8 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        // Atacante sempre usa a tática agressiva: vai direto na bola, entra na área
-        return std::make_shared<AggressivePushTactic>();
+        // Nova Lógica: usa a máquina de estados orientada a vetores (BYPASS -> ALIGN -> PUSH)
+        return std::make_shared<VectorAttackTactic>();
     }
 };
 
@@ -406,8 +433,8 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        // Sempre ciclo agressivo GoToBall → Kick sem espera
-        return std::make_shared<AggressivePushTactic>();
+        // Nova Lógica: atacante desafiante usa o ataque vetorial unificado
+        return std::make_shared<VectorAttackTactic>();
     }
 };
 

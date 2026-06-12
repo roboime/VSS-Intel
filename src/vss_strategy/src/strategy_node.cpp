@@ -100,6 +100,7 @@ private:
     vss::GameContext       ctx_;
     double                 wheel_base_;
     uint32_t               frame_count_ = 0;
+    std::array<vss::RobotCommand, 3> last_cmds_;
 
     // Subscribers
     rclcpp::Subscription<vss_msgs::msg::BallState>::SharedPtr sub_ball_;
@@ -127,13 +128,30 @@ private:
         // ── Roda o Playbook ───────────────────────────────────────────────
         auto cmds = playbook_.update(ctx_);
 
-        // ── Publica comandos ──────────────────────────────────────────────
+        // ── Slew Rate Limiter Dinâmico ────────────────────────────────────
         auto out_msg = vss_msgs::msg::RobotCommandArray();
         for (int i = 0; i < 3; i++) {
+            auto& last = last_cmds_[i];
+            auto& cur  = cmds[i];
+
+            double max_delta = cur.is_fast_slew ? 0.45 : 0.15;
+
+            if (cur.wheel_left > last.wheel_left + max_delta) 
+                cur.wheel_left = last.wheel_left + max_delta;
+            else if (cur.wheel_left < last.wheel_left - max_delta) 
+                cur.wheel_left = last.wheel_left - max_delta;
+
+            if (cur.wheel_right > last.wheel_right + max_delta) 
+                cur.wheel_right = last.wheel_right + max_delta;
+            else if (cur.wheel_right < last.wheel_right - max_delta) 
+                cur.wheel_right = last.wheel_right - max_delta;
+
+            last = cur;
+
             auto cmd_msg         = vss_msgs::msg::RobotCommand();
-            cmd_msg.id           = cmds[i].id;
-            cmd_msg.wheel_left   = cmds[i].wheel_left;
-            cmd_msg.wheel_right  = cmds[i].wheel_right;
+            cmd_msg.id           = cur.id;
+            cmd_msg.wheel_left   = cur.wheel_left;
+            cmd_msg.wheel_right  = cur.wheel_right;
             out_msg.commands.push_back(cmd_msg);
         }
         pub_commands_->publish(out_msg);

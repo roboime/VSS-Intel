@@ -54,17 +54,17 @@ struct KickSkillParams {
     double kick_speed = 2.5;              // m/s (velocidade máxima das rodas, ajustado para 2.5)
 
     // Fator de escala do impulso (LabVIEW: 0.5 × 200)
-    double kick_impulse_factor = 0.5;
+    double kick_impulse_factor = 0.8;     // Aumentado para 0.8 para aceleração agressiva imediata
 
     // Threshold de alinhamento para considerar "apontando para o gol"
     // Extraído do fluxo: entra em "Robo vai pra bola" quando alinhado
-    double alignment_threshold_rad = 0.15;  // ~8.6 graus
+    double alignment_threshold_rad = 0.30;  // Aumentado para 0.30 rad (~17.2 graus) para chutar mesmo ligeiramente desalinhado
 
     // Ganho de rotação durante a fase ALIGN
     double kp_rotation = 6.0;             // Ajustado para 6.0 (intermediário estável)
 
     // Distância para considerar que o chute foi executado
-    double kick_done_dist = 0.06;   // metros da bola
+    double kick_done_dist = 0.04;   // Reduzido para 0.04 metros para contato físico firme antes de finalizar
 
     // Base das rodas
     double wheel_base = 0.075;
@@ -154,19 +154,17 @@ private:
             rotation_dir = (ctx.ball.y < robot.y) ? -1.0 : 1.0;
         }
 
-        // ── Alinhado? → transita para CHARGE ──────────────────────────────
+        // ── Alinhado? → transita para CHARGE ──────────────────────────────────
         if (std::abs(angle_err) < params_.alignment_threshold_rad) {
             state_ = State::CHARGE;
             return doCharge(robot, ctx);
         }
 
-        // ── Rotaciona no lugar ─────────────────────────────────────────────
-        // usa rotation_dir para sobrescrever o sinal do controlador P
-        // (LabVIEW: -1=horário, +1=anti-horário)
-        double omega = rotation_dir * params_.kp_rotation
-                       * std::abs(angle_err);
-        omega = std::clamp(omega, -params_.kick_speed / params_.wheel_base * 0.5,
-                                   params_.kick_speed / params_.wheel_base * 0.5);
+        // ── Rotaciona no lugar com rampa de desaceleração angular ──────────────
+        // (evita overshoot e oscilação ao se alinhar em trajetórias diagonais)
+        double omega_raw = rotation_dir * params_.kp_rotation * std::abs(angle_err);
+        double omega = applyAngularRamp(angle_err, omega_raw,
+                                        params_.kick_speed / params_.wheel_base * 0.5);
 
         return clampCommand(RobotCommand::fromVW(robot.id, 0.0, omega,
                                                   params_.wheel_base));
@@ -185,36 +183,31 @@ private:
 
         // Chute executado: robô chegou perto o suficiente da bola
         if (dist < params_.kick_done_dist) {
-            state_   = State::DONE;
+            state_    = State::DONE;
             finished_ = true;
-            // Último frame: máxima velocidade para garantir o chute
+            // Último frame: máxima velocidade — prensa a bola contra qualquer adversário
             return clampCommand(
                 RobotCommand::fromVW(robot.id,
-                                     params_.kick_speed,
-                                     0.0,
+                                     params_.kick_speed, 0.0,
                                      params_.wheel_base));
         }
 
         frames_charging_++;
 
-        // Mantém correção angular leve durante a corrida
+        // Correção angular leve durante a corrida (ângulo sempre normalizado)
         double angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
 
-        // vx_desired = 1000 no LabVIEW → máxima velocidade
-        // impulso_factor × 200 → escala do arranque
+        // Velocidade total: rampa rápida de 80% → 100% em 10 frames
         double v = params_.kick_speed * params_.kick_impulse_factor
                    + params_.kick_speed * (1.0 - params_.kick_impulse_factor)
                      * std::min(1.0, frames_charging_ / 10.0);
-
-        // Velocidade total = máxima quando frames > 10
         v = std::min(v, params_.kick_speed);
 
-        double omega = 3.0 * angle_err;  // correção suave
-
-        // Zona morta para o erro angular durante a arrancada
-        if (std::abs(angle_err) < 0.05) {
-            omega = 0.0;
-        }
+        // APF/avoidCollisions DESATIVADO na fase CHARGE:
+        // O robô deve prensar a bola mesmo contra adversários.
+        // Apenas suavizamos a trajetória com omega leve.
+        double omega = 3.0 * angle_err;
+        if (std::abs(angle_err) < 0.05) omega = 0.0;
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));

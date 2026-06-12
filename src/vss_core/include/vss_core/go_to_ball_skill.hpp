@@ -9,9 +9,9 @@ namespace vss {
 
 // Params fora da classe para evitar problema de default argument
 struct GoToBallSkillParams {
-    double kp_linear         = 3.5;   // Ajustado para 3.5 (valor intermediário estável)
+    double kp_linear         = 5.0;   // Aumentado para 5.0 para aproximação mais agressiva
     double kp_angular        = 5.0;   // Ajustado para 5.0 (valor intermediário estável)
-    double arrival_threshold = 0.08;  // metros
+    double arrival_threshold = 0.04;  // Reduzido para 0.04m para se aproximar mais do alvo
     double ball_offset       = 0.04;  // metros atrás da bola em dir. ao gol
     double area_danger_dist  = 0.12;  // dist. "perto da área" (LabVIEW)
     double area_exit_offset  = 0.12;  // 120mm → LabVIEW "x + 120"
@@ -39,6 +39,7 @@ public:
 
     void init(const RobotState& robot, const GameContext& ctx) override {
         Skill::init(robot, ctx);
+        last_v_ = 0.0;
     }
 
     RobotCommand execute(const RobotState& robot,
@@ -61,7 +62,7 @@ public:
         target_x = std::clamp(target_x, ctx.field.min_x()+m, ctx.field.max_x()-m);
         target_y = std::clamp(target_y, ctx.field.min_y()+m, ctx.field.max_y()-m);
 
-        // ── 4. Erro de posição e ângulo ───────────────────────────────────
+        // ── Erro de posição e ângulo ───────────────────────────────────────────
         double dx   = target_x - robot.x;
         double dy   = target_y - robot.y;
         double dist = std::hypot(dx, dy);
@@ -71,25 +72,59 @@ public:
             return RobotCommand::stop(robot.id);
         }
 
-        double angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
+        // ── Direção corrigida pelo APF ─────────────────────────────────────────
+        // ignore_robot_id = -1: aplica repulsão de todos os robôs próximos.
+        // A bola está no campo; se um adversário está segurando a bola,
+        // o atacante deve empurrá-lo — o APF não repele o robô adversário
+        // que ESTÁ na posição da bola (distância < arrival_threshold do alvo).
+        // Para garantir isso, desativamos a repulsão de qualquer robô cuja
+        // distância ao ALVO (target) seja menor que 0.08m.
+        int ignore_id = -1;
+        for (const auto& enemy : ctx.enemies) {
+            if (!enemy.valid) continue;
+            double det = std::hypot(enemy.x - target_x, enemy.y - target_y);
+            if (det < 0.08) { ignore_id = static_cast<int>(enemy.id); break; }
+        }
 
-        // ── 5. Controle proporcional ──────────────────────────────────────
-        // cos(angle_err) é o fator 0.35 do LabVIEW:
-        // reduz v linear quando robô está mal alinhado
+        double target_angle;
+        if (dist >= 0.02) {
+            target_angle = applyAPF(robot, ctx, target_x, target_y, ignore_id);
+        } else {
+            target_angle = robot.theta;
+        }
+
+        // ── Erro angular (normalizado em [-PI, PI]) ───────────────────────────
+        double angle_err = normalizeAngle(target_angle - robot.theta);
+
+        // ── Zona morta de ângulo ──────────────────────────────────────────────
+        if (std::abs(angle_err) < 0.05) angle_err = 0.0;
+
+        // ── Controle proporcional ─────────────────────────────────────────────
         double align = std::max(0.0, std::cos(angle_err));
         double v     = std::clamp(params_.kp_linear * dist * align,
                                   -params_.max_linear_speed,
                                    params_.max_linear_speed);
-        
-        // Desvio de obstáculos e prevenção de colisões
+
+        // Velocidade mínima na aproximação final
+        if (dist < 0.15 && align > 0.5) {
+            v = std::max(v, 1.0 * align);
+        }
+
+        // Desvio de obstáculos (frenagem linear)
         v = avoidCollisions(robot, ctx, v);
 
-        double omega = params_.kp_angular * angle_err;
+        // ── Omega com rampa de desaceleração angular ──────────────────────────
+        double omega_raw = params_.kp_angular * angle_err;
+        double omega = applyAngularRamp(angle_err, omega_raw,
+                                        params_.kp_angular * M_PI);
 
-        // Zona morta para o erro angular para evitar tremedeira/oscilação residual
-        if (std::abs(angle_err) < 0.05) {
-            omega = 0.0;
-        }
+        // ── Perfil de Aceleração Trapezoidal (Linear) ─────────────────────────
+        v = applyLinearRamp(v, last_v_, 5.0); // max accel 5.0 m/s^2
+
+        // ── Zona morta de distância ───────────────────────────────────────────
+        if (dist < 0.02) { v = 0.0; omega = 0.0; }
+
+        last_v_ = v;
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));
@@ -99,6 +134,7 @@ public:
 
 private:
     Params params_;
+    double last_v_ = 0.0;
 
     // Extrai as condições comentadas no LabVIEW sobre a área do goleiro
     std::tuple<double,double,bool>

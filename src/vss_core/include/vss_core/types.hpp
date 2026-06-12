@@ -63,16 +63,18 @@ struct RobotCommand {
     uint8_t id          = 0;
     double  wheel_left  = 0.0;   // m/s
     double  wheel_right = 0.0;   // m/s
+    bool    is_fast_slew = false; // Flag para desbloqueio dinâmico do acelerador
 
     // Fábrica a partir de v linear + ω angular
     // L = distância entre rodas (metros)
     static RobotCommand fromVW(uint8_t id, double v, double omega,
-                               double wheel_base = 0.075)
+                               double wheel_base = 0.075, bool is_fast = false)
     {
         RobotCommand cmd;
         cmd.id          = id;
         cmd.wheel_right = v + (omega * wheel_base / 2.0);
         cmd.wheel_left  = v - (omega * wheel_base / 2.0);
+        cmd.is_fast_slew = is_fast;
         return cmd;
     }
 

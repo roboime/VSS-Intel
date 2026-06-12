@@ -19,7 +19,7 @@ namespace vss {
 
 struct RotateToAngleParams {
     double kp_angular         = 6.5;   // Ajustado para 6.5 (valor intermediário estável)
-    double arrival_threshold  = 0.08;  // rad (~4.6°)
+    double arrival_threshold  = 0.25;  // Aumentado para 0.25 rad (~14.3 graus) para evitar oscilações ao mirar
     double max_omega          = 10.0;  // rad/s (Ajustado para 10.0)
     double wheel_base         = 0.075;
 };
@@ -51,6 +51,7 @@ public:
                          const GameContext& ctx) override
     {
         (void)ctx;
+        // Erro angular estritamente normalizado em [-PI, PI]
         double err = normalizeAngle(target_angle_ - robot.theta);
 
         if (std::abs(err) < params_.arrival_threshold) {
@@ -58,8 +59,10 @@ public:
             return RobotCommand::stop(robot.id);
         }
 
-        double omega = std::clamp(params_.kp_angular * err,
-                                  -params_.max_omega, params_.max_omega);
+        // Controlador P com rampa de desaceleração angular para evitar overshoot
+        double omega_raw = params_.kp_angular * err;
+        double omega = applyAngularRamp(err, omega_raw, params_.max_omega);
+
         return clampCommand(RobotCommand::fromVW(robot.id, 0.0, omega,
                                                   params_.wheel_base));
     }
