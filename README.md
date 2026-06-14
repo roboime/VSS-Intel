@@ -1,6 +1,7 @@
 # VssIntel
 codigo novo para a modalidade vss
 Branch Alpha - modelo teste do Pariz
+
 Leia também o arquivo Architecture.md
 
 Aqui está o tutorial passo a passo completo, direto ao ponto e pronto para ser compartilhado com os novos membros do time.
