@@ -11,60 +11,49 @@ namespace vss {
 //
 //  Tradução direta do KickSkillVSS.vi — extraído das 4 fotos do LabVIEW.
 //
-//  LÓGICA COMPLETA IDENTIFICADA:
+//  ESTADO INTERNO: máquina de 4 estados
+//    ALIGN   → gira até apontar para o gol
+//    CHARGE  → avança em linha reta em direção à bola (GoToKick)
+//    UNSTICK → recuo linear bruto (25fr) + giro de escape (20fr)
+//    DONE    → chute executado, skill finalizada
 //
-//  1. DETECÇÃO DE PAREDES (limiares em unidades LabVIEW convertidos p/ metros):
-//     · "Perto de paredes verticais?"   → threshold 90 unid. ≈ 0.09 m
-//     · "Perto de paredes horizontais?" → threshold 70 unid. ≈ 0.07 m
-//     (campo VSS ≈ 1500×1300 unidades LabVIEW → 1.5×1.3 m)
+//  SALVAGUARDAS ANTI-TRAVAMENTO NO CHARGE:
 //
-//  2. DECISÃO DE ROTAÇÃO ("Case de decisão da rotação"):
-//     · -1 = sentido horário       (Rotate Clockwise)
-//     · +1 = sentido anti-horário  (Rotate anti-clockwise)
-//     · Condição: "y bola < y robo?" determina qual sentido girar
-//       → bola abaixo do robô  → rotaciona horário (gira para baixo)
-//       → bola acima do robô   → rotaciona anti-horário (gira para cima)
-//     · Perto de parede vertical/horizontal modifica esse comportamento
-//       para evitar travar no canto
+//  1. isFrontBlocked() — Sistema Tridente (3 probes paralelos):
+//     · Probe Centro  : 8.75 cm à frente no eixo theta
+//     · Probe Esquerda: offset lateral -3.75 cm (quina esq.), 6.0 cm à frente
+//     · Probe Direita : offset lateral +3.75 cm (quina dir.), 6.0 cm à frente
+//     Cobre toda a face frontal do chassi 7.5×7.5 cm. Um único probe central
+//     (raycast) dava falso-negativo quando a quina lateral já estava colida.
 //
-//  3. QUANDO ALINHADO → "Robo vai pra bola":
-//     · Entra no case True do alinhamento
-//     · GoToKick com dest_x = -200 unid. ≈ -0.20 m (relativo)
-//                    dest_y = -200 unid. ≈ -0.20 m (relativo)
-//     · vx_desired = 1000 (velocidade máxima de chute!)
-//     · Fator 0.5 + 200 → escala do impulso de chute
+//  2. Stuck detection: 45 frames com |v| > 1.5 m/s e deslocamento < 3 cm
+//     → transita para UNSTICK
 //
-//  4. CASO ESPECIAL PENALTI:
-//     · "caso penalti" → branch separado com KickPenaltyAlly
-//     · Verifica VssPlay e KeeperTeam para identificar situação
-//
-//  ESTADO INTERNO: máquina de 3 estados
-//    ALIGN  → gira até apontar para o gol
-//    CHARGE → avança em linha reta em direção à bola (GoToKick)
-//    DONE   → chute executado, skill finalizada
+//  ANÁLISE DA RAMPA vs. UNSTICK:
+//     fromVW() emite comandos de roda diretamente, sem passar por
+//     applyLinearRamp(). O impulso de -3.0 m/s é aplicado instantaneamente
+//     no primeiro frame do UNSTICK — sem suavização.
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct KickSkillParams {
     // Thresholds de parede (LabVIEW: 90 e 70 unidades → metros)
-    double near_vertical_wall   = 0.09;   // "Perto de paredes verticais?"
-    double near_horizontal_wall = 0.07;   // "Perto de paredes horizontais?"
+    double near_vertical_wall   = 0.09;
+    double near_horizontal_wall = 0.07;
 
-    // Velocidade máxima de chute (LabVIEW: vx_desired = 1000)
-    // Normalizado para m/s do FIRASim
-    double kick_speed = 2.5;              // m/s (velocidade máxima das rodas, ajustado para 2.5)
+    // Velocidade máxima de chute
+    double kick_speed = 2.5;              // m/s
 
-    // Fator de escala do impulso (LabVIEW: 0.5 × 200)
-    double kick_impulse_factor = 0.8;     // Aumentado para 0.8 para aceleração agressiva imediata
+    // Fator de escala do impulso inicial
+    double kick_impulse_factor = 0.8;
 
-    // Threshold de alinhamento para considerar "apontando para o gol"
-    // Extraído do fluxo: entra em "Robo vai pra bola" quando alinhado
-    double alignment_threshold_rad = 0.30;  // Aumentado para 0.30 rad (~17.2 graus) para chutar mesmo ligeiramente desalinhado
+    // Threshold de alinhamento
+    double alignment_threshold_rad = 0.30;  // ~17.2 graus
 
-    // Ganho de rotação durante a fase ALIGN
-    double kp_rotation = 6.0;             // Ajustado para 6.0 (intermediário estável)
+    // Ganho de rotação durante ALIGN
+    double kp_rotation = 6.0;
 
-    // Distância para considerar que o chute foi executado
-    double kick_done_dist = 0.04;   // Reduzido para 0.04 metros para contato físico firme antes de finalizar
+    // Distância de conclusão do chute
+    double kick_done_dist = 0.04;         // 4 cm — contato físico firme
 
     // Base das rodas
     double wheel_base = 0.075;
@@ -74,7 +63,6 @@ class KickSkill final : public Skill {
 public:
     using Params = KickSkillParams;
 
-    // Modo: chute normal ou penalti
     enum class Mode { NORMAL, PENALTY };
 
     explicit KickSkill(Params p = Params(), Mode m = Mode::NORMAL)
@@ -82,16 +70,22 @@ public:
 
     void init(const RobotState& robot, const GameContext& ctx) override {
         Skill::init(robot, ctx);
-        state_  = State::ALIGN;
+        state_           = State::ALIGN;
         frames_charging_ = 0;
+        stuck_frames_    = 0;
+        unstick_frames_  = 0;
+        last_kick_v_     = 0.0;
+        stuck_ref_x_     = robot.x;
+        stuck_ref_y_     = robot.y;
     }
 
     RobotCommand execute(const RobotState& robot,
                          const GameContext& ctx) override
     {
         switch (state_) {
-            case State::ALIGN:  return doAlign(robot, ctx);
-            case State::CHARGE: return doCharge(robot, ctx);
+            case State::ALIGN:   return doAlign(robot, ctx);
+            case State::CHARGE:  return doCharge(robot, ctx);
+            case State::UNSTICK: return doUnstick(robot, ctx);
             case State::DONE:
                 finished_ = true;
                 return RobotCommand::stop(robot.id);
@@ -107,61 +101,152 @@ private:
     Params params_;
     Mode   mode_;
 
-    enum class State { ALIGN, CHARGE, DONE };
-    State   state_           = State::ALIGN;
-    int     frames_charging_ = 0;
+    enum class State { ALIGN, CHARGE, UNSTICK, DONE };
+    State state_           = State::ALIGN;
+    int   frames_charging_ = 0;
+
+    // Estado de Unstick
+    double stuck_ref_x_    = 0.0;
+    double stuck_ref_y_    = 0.0;
+    int    stuck_frames_   = 0;
+    int    unstick_frames_ = 0;
+    double last_kick_v_    = 0.0;
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  isFrontBlocked — Sistema Tridente (3 probes paralelos)
+    //
+    //  ANÁLISE DO FALSO-NEGATIVO DO RAYCAST CENTRAL:
+    //  O chassi tem 7.5×7.5 cm. As quinas ficam a √(3.75²+3.75²) = 5.30 cm
+    //  do centro. Em abordagem diagonal (ex: 30°), a quina lateral pode estar
+    //  a 0 cm do obstáculo enquanto o probe central ainda lê 5+ cm de clearance.
+    //
+    //  Solução: 3 probes cobrem toda a face frontal do cubo:
+    //
+    //    Probe Esquerda           Probe Centro           Probe Direita
+    //    (quina esq. + 6 cm)    (eixo θ + 8.75 cm)    (quina dir. + 6 cm)
+    //         ●                       ●                       ●
+    //         |                       |                       |
+    //    ┌────┼───────────────────────┼───────────────────────┼────┐
+    //    │    ↑ -3.75 cm             centro             +3.75 cm  │
+    //    │              FACE FRONTAL DO CHASSI (7.5 cm)           │
+    //    └────────────────────────────────────────────────────────┘
+    //
+    //  Margem do probe lateral: 6.0 cm (além da quina que já está a 5.30 cm).
+    //  Margem do probe central: 8.75 cm = 3.75 cm (half-chassis) + 5.0 cm.
+    //
+    //  Adversários próximos da bola (< 10 cm) são ignorados — são o alvo.
+    // ─────────────────────────────────────────────────────────────────────
+    bool isFrontBlocked(const RobotState& robot, const GameContext& ctx) const {
+        const double cos_t = std::cos(robot.theta);
+        const double sin_t = std::sin(robot.theta);
+
+        // Vetores unitários: frente (eixo theta) e lateral (perpendicular)
+        // lat_x = -sin(theta), lat_y = cos(theta)  →  lado esquerdo
+        const double lat_x = -sin_t;
+        const double lat_y =  cos_t;
+
+        // Metade do chassi (offset lateral das quinas)
+        const double half_chassis = 0.0375;  // 3.75 cm
+
+        // ── Três pontos de sondagem ───────────────────────────────────────
+        // Centro: 8.75 cm à frente (half_chassis + 5 cm de margem)
+        // Laterais: quina ± 3.75 cm, 6 cm à frente da quina
+        const double fwd_center = half_chassis + 0.05;  // 8.75 cm
+        const double fwd_corner = 0.06;                  // 6 cm além da quina
+
+        struct Probe { double x, y; };
+        Probe probes[3] = {
+            // Centro
+            { robot.x + fwd_center * cos_t,
+              robot.y + fwd_center * sin_t },
+            // Quina Esquerda
+            { robot.x - half_chassis * lat_x + fwd_corner * cos_t,
+              robot.y - half_chassis * lat_y + fwd_corner * sin_t },
+            // Quina Direita
+            { robot.x + half_chassis * lat_x + fwd_corner * cos_t,
+              robot.y + half_chassis * lat_y + fwd_corner * sin_t },
+        };
+
+        const double wall_margin = 0.01;
+
+        for (const auto& p : probes) {
+            // ── Parede ────────────────────────────────────────────────────
+            if (p.x < ctx.field.min_x() + wall_margin ||
+                p.x > ctx.field.max_x() - wall_margin ||
+                p.y < ctx.field.min_y() + wall_margin ||
+                p.y > ctx.field.max_y() - wall_margin) {
+                return true;
+            }
+        }
+
+        // ── Robôs (aliados e adversários) ──────────────────────────────
+        // Limiar: diâmetro físico do cubo (7.6 cm) + 5 cm de margem
+        const double robot_block_dist = 0.076 + 0.05;
+        const double cone_half = M_PI / 3.0;  // cone frontal de 60°
+
+        for (const auto& ally : ctx.allies) {
+            if (!ally.valid || ally.id == robot.id) continue;
+            double dist = std::hypot(ally.x - robot.x, ally.y - robot.y);
+            if (dist < robot_block_dist) {
+                double ang = std::atan2(ally.y - robot.y, ally.x - robot.x);
+                if (std::abs(normalizeAngle(ang - robot.theta)) < cone_half)
+                    return true;
+            }
+        }
+        for (const auto& enemy : ctx.enemies) {
+            if (!enemy.valid) continue;
+            // Ignora adversários próximos da bola — são o alvo do chute
+            double enemy_to_ball = std::hypot(enemy.x - ctx.ball.x,
+                                               enemy.y - ctx.ball.y);
+            if (enemy_to_ball < 0.10) continue;
+
+            double dist = std::hypot(enemy.x - robot.x, enemy.y - robot.y);
+            if (dist < robot_block_dist) {
+                double ang = std::atan2(enemy.y - robot.y, enemy.x - robot.x);
+                if (std::abs(normalizeAngle(ang - robot.theta)) < cone_half)
+                    return true;
+            }
+        }
+        return false;
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     //  Fase 1: ALIGN
-    //  "Case de decisão da rotação"
-    //  Gira o robô até apontar para o gol, considerando paredes próximas.
     // ─────────────────────────────────────────────────────────────────────
     RobotCommand doAlign(const RobotState& robot, const GameContext& ctx) {
         auto goal = ctx.enemyGoalCenter();
 
-        // Ângulo desejado: robô → gol passando pela bola
         double ang_to_ball = std::atan2(ctx.ball.y - robot.y,
                                          ctx.ball.x - robot.x);
         double ang_to_goal = std::atan2(goal.y - ctx.ball.y,
                                          goal.x - ctx.ball.x);
 
-        // Alvo de orientação: alinhar bola → gol
-        // Em penalti, aponta direto para o gol sem considerar a bola
-        double desired_angle = (mode_ == Mode::PENALTY)
-                               ? ang_to_goal
-                               : ang_to_ball;
-
+        double desired_angle = (mode_ == Mode::PENALTY) ? ang_to_goal : ang_to_ball;
         double angle_err = normalizeAngle(desired_angle - robot.theta);
 
-        // ── Verificação de paredes ────────────────────────────────────────
-        // "Perto de paredes verticais?"  (paredes em X)
+        // Verificação de paredes
         bool near_vertical   = (ctx.field.max_x() - std::abs(robot.x))
                                 < params_.near_vertical_wall;
-        // "Perto de paredes horizontais?" (paredes em Y)
         bool near_horizontal = (ctx.field.max_y() - std::abs(robot.y))
                                 < params_.near_horizontal_wall;
 
-        // ── Decisão de sentido de rotação ─────────────────────────────────
-        // "y bola < y robo?" → horário (-1) ou anti-horário (+1)
-        // Quando perto de parede, inverte lógica para não travar no canto
         double rotation_dir;
         if (near_vertical || near_horizontal) {
-            // Perto de parede: força rotação contrária para se afastar
             rotation_dir = (ctx.ball.y < robot.y) ? 1.0 : -1.0;
         } else {
-            // Lógica normal do LabVIEW:
-            // bola abaixo → horário (-1) = gira para alcançar a bola
             rotation_dir = (ctx.ball.y < robot.y) ? -1.0 : 1.0;
         }
 
-        // ── Alinhado? → transita para CHARGE ──────────────────────────────────
         if (std::abs(angle_err) < params_.alignment_threshold_rad) {
-            state_ = State::CHARGE;
+            state_           = State::CHARGE;
+            frames_charging_ = 0;
+            stuck_frames_    = 0;
+            stuck_ref_x_     = robot.x;
+            stuck_ref_y_     = robot.y;
+            last_kick_v_     = 0.0;
             return doCharge(robot, ctx);
         }
 
-        // ── Rotaciona no lugar com rampa de desaceleração angular ──────────────
-        // (evita overshoot e oscilação ao se alinhar em trajetórias diagonais)
         double omega_raw = rotation_dir * params_.kp_rotation * std::abs(angle_err);
         double omega = applyAngularRamp(angle_err, omega_raw,
                                         params_.kick_speed / params_.wheel_base * 0.5);
@@ -171,21 +256,22 @@ private:
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  Fase 2: CHARGE  ("Robo vai pra bola" / GoToKick)
-    //  LabVIEW: dest_x = -200, dest_y = -200, vx_desired = 1000
-    //  Robô avança em linha reta em direção à bola com velocidade máxima.
-    //  O fator 0.5 × 200 define a magnitude do impulso inicial.
+    //  Fase 2: CHARGE
+    //
+    //  Salvaguardas:
+    //    · isFrontBlocked() (Tridente): para força linear se chassi está
+    //      bloqueado. Mantém apenas correção angular.
+    //    · Stuck detection: 45 frames → UNSTICK
     // ─────────────────────────────────────────────────────────────────────
     RobotCommand doCharge(const RobotState& robot, const GameContext& ctx) {
         double dx   = ctx.ball.x - robot.x;
         double dy   = ctx.ball.y - robot.y;
         double dist = std::hypot(dx, dy);
 
-        // Chute executado: robô chegou perto o suficiente da bola
         if (dist < params_.kick_done_dist) {
-            state_    = State::DONE;
-            finished_ = true;
-            // Último frame: máxima velocidade — prensa a bola contra qualquer adversário
+            state_       = State::DONE;
+            finished_    = true;
+            last_kick_v_ = params_.kick_speed;
             return clampCommand(
                 RobotCommand::fromVW(robot.id,
                                      params_.kick_speed, 0.0,
@@ -194,30 +280,111 @@ private:
 
         frames_charging_++;
 
-        // Correção angular leve durante a corrida (ângulo sempre normalizado)
+        // ── Stuck detection ───────────────────────────────────────────────
+        double dist_moved = std::hypot(robot.x - stuck_ref_x_,
+                                        robot.y - stuck_ref_y_);
+        if (last_kick_v_ > 1.5) {
+            stuck_frames_++;
+            if (dist_moved > 0.030) {
+                stuck_frames_ = 0;
+                stuck_ref_x_  = robot.x;
+                stuck_ref_y_  = robot.y;
+            }
+        } else {
+            stuck_frames_ = 0;
+            stuck_ref_x_  = robot.x;
+            stuck_ref_y_  = robot.y;
+        }
+
+        if (stuck_frames_ > 45) {
+            state_          = State::UNSTICK;
+            stuck_frames_   = 0;
+            unstick_frames_ = 0;
+            last_kick_v_    = -3.0;
+            return clampCommand(RobotCommand::fromVW(robot.id, -3.0, 0.0,
+                                                      params_.wheel_base));
+        }
+
+        // ── isFrontBlocked (Tridente) ─────────────────────────────────────
+        if (isFrontBlocked(robot, ctx)) {
+            last_kick_v_ = 0.0;
+            double angle_fwd = normalizeAngle(
+                std::atan2(ctx.ball.y - robot.y, ctx.ball.x - robot.x) - robot.theta);
+            return clampCommand(RobotCommand::fromVW(robot.id, 0.0, 3.0 * angle_fwd,
+                                                      params_.wheel_base));
+        }
+
+        // ── Avanço ────────────────────────────────────────────────────────
         double angle_err = normalizeAngle(std::atan2(dy, dx) - robot.theta);
 
-        // Velocidade total: rampa rápida de 80% → 100% em 10 frames
         double v = params_.kick_speed * params_.kick_impulse_factor
                    + params_.kick_speed * (1.0 - params_.kick_impulse_factor)
                      * std::min(1.0, frames_charging_ / 10.0);
         v = std::min(v, params_.kick_speed);
+        last_kick_v_ = v;
 
-        // APF/avoidCollisions DESATIVADO na fase CHARGE:
-        // O robô deve prensar a bola mesmo contra adversários.
-        // Apenas suavizamos a trajetória com omega leve.
         double omega = 3.0 * angle_err;
         if (std::abs(angle_err) < 0.05) omega = 0.0;
 
         return clampCommand(RobotCommand::fromVW(robot.id, v, omega,
                                                   params_.wheel_base));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    //  Fase 3: UNSTICK — Recuo bruto + giro de escape
+    //
+    //  ANÁLISE DA RAMPA: fromVW() emite velocidade de roda DIRETAMENTE
+    //  sem passar por applyLinearRamp. O -3.0 m/s é aplicado no frame 1
+    //  sem qualquer suavização — impulso bruto para romper encaixes.
+    //
+    //  FASE 1 (25 frames, -3.0 m/s, ω=0):
+    //    Recuo bruto puro. A 3.0 m/s e 60 Hz, o impulso inicial é suficiente
+    //    para separar as quinas do cubo (gap > 7.5 cm em ~3-4 frames).
+    //    25 frames absorvem os primeiros frames de resistência do simulador.
+    //
+    //  FASE 2 (20 frames, -1.0 m/s, ω=±12):
+    //    Giro com clearance já garantido. Sem gap, o giro prenderia as quinas.
+    //
+    //  Retorna ao ALIGN para reavaliação completa antes do próximo chute.
+    // ─────────────────────────────────────────────────────────────────────
+    RobotCommand doUnstick(const RobotState& robot, const GameContext& ctx) {
+        (void)ctx;
+        unstick_frames_++;
+
+        if (unstick_frames_ > 45) {
+            state_          = State::ALIGN;
+            stuck_frames_   = 0;
+            unstick_frames_ = 0;
+            last_kick_v_    = 0.0;
+            stuck_ref_x_    = robot.x;
+            stuck_ref_y_    = robot.y;
+            return doAlign(robot, ctx);
+        }
+
+        if (unstick_frames_ <= 25) {
+            // FASE 1: Impulso bruto de ré — SEM omega, SEM rampa interna.
+            // [FIX C6] is_fast_slew=true: slew externo usa Δv=0.45/frame
+            // em vez de 0.15/frame. Sem o flag, o StrategyNode limitava o
+            // impulso a ~-1.75 m/s reais (vs. -3.0 projetados) porque
+            // from last_cmd ~+2.0 até -3.0 levaria 33 frames @0.15/frame,
+            // mas a fase 1 só dura 25 frames.
+            last_kick_v_ = -3.0;
+            return clampCommand(RobotCommand::fromVW(robot.id, -3.0, 0.0,
+                                                      params_.wheel_base, true));
+        } else {
+            // FASE 2: Giro com ré leve — clearance já garantido pela FASE 1.
+            // [FIX C6] Mantemos is_fast_slew=true na fase 2 também:
+            // o -1.0 m/s precisa ser atingido rapidamente para o giro ser efetivo.
+            double spin_dir = (robot.y > 0.0) ? 1.0 : -1.0;
+            last_kick_v_ = -1.0;
+            return clampCommand(RobotCommand::fromVW(robot.id, -1.0, 12.0 * spin_dir,
+                                                      params_.wheel_base, true));
+        }
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KickPenaltySkill  —  "caso penalti" do LabVIEW
-//  Variante do KickSkill com alinhamento direto ao gol e chute mais forte.
-//  Identificado no diagrama: branch KickPenaltyAlly com VssPlay/KeeperTeam.
 // ─────────────────────────────────────────────────────────────────────────────
 class KickPenaltySkill final : public Skill {
 public:

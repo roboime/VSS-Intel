@@ -17,7 +17,8 @@ install(TARGETS vss_core EXPORT vss_core_targets)
 install(DIRECTORY include/ DESTINATION include)
  
 ament_export_targets(vss_core_targets HAS_LIBRARY_TARGET)
- 
+ament_export_include_directories(include)
+
 ament_package()
  
 

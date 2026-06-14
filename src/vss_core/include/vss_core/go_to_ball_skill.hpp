@@ -99,7 +99,7 @@ public:
         // ── Zona morta de ângulo ──────────────────────────────────────────────
         if (std::abs(angle_err) < 0.05) angle_err = 0.0;
 
-        // ── Controle proporcional ─────────────────────────────────────────────
+        // ── Controle proporcional com fator de alinhamento ────────────────────────────
         double align = std::max(0.0, std::cos(angle_err));
         double v     = std::clamp(params_.kp_linear * dist * align,
                                   -params_.max_linear_speed,
@@ -108,6 +108,16 @@ public:
         // Velocidade mínima na aproximação final
         if (dist < 0.15 && align > 0.5) {
             v = std::max(v, 1.0 * align);
+        }
+
+        // [CORRIGIDO Bug #2D] Piso de velocidade para erros angulares elevados.
+        // Para bola lateral (~80°), align ≈ 0.17 → v ≈ 0.26 m/s: o robô quase para
+        // e oscila tentando se orientar sem transladar, nunca completando a órbita.
+        // Correção: quando |angle_err| > 60° e o robô ainda não chegou,
+        // mantém velocidade mínima de 0.5 m/s para que a órbita avance.
+        // A rampa de aceleração trapezoidal (applyLinearRamp) absorve a transição suavemente.
+        if (std::abs(angle_err) > M_PI / 3.0 && dist > params_.arrival_threshold) {
+            v = std::max(v, 0.5);
         }
 
         // Desvio de obstáculos (frenagem linear)

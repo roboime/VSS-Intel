@@ -22,9 +22,33 @@ namespace vss {
 //  DefendGoalTactic  —  usada pelo KeeperRoleVSS
 //  Lógica: goleiro se posiciona na linha do gol, movendo-se lateralmente
 //  para interceptar a trajetória da bola. Não sai da área do goleiro.
+//
+//  [FIX REGRESSÃO] A versão anterior instanciava GoToPositionSkill a CADA
+//  frame dentro de execute(), zerado last_v_ a cada ciclo. Isso fazia a
+//  rampa trapezoidal recomecer do zero em todo tick — o goleiro nunca
+//  superava os primeiros frames de aceleração, resultando no movimento em
+//  câmera lenta ("samba").
+//  Correção: skill_ é membro persistente da tática. Apenas o alvo é
+//  atualizado a cada frame via setTarget(), preservando last_v_ entre ciclos.
+//  Parâmetros do goleiro: kp_linear alto + sem stop_on_arrival (loop contínuo).
 // ─────────────────────────────────────────────────────────────────────────────
 class DefendGoalTactic final : public Tactic {
 public:
+    DefendGoalTactic() {
+        // Parâmetros específicos do goleiro:
+        //   kp_linear alto (5.0) → reação rápida no eixo Y.
+        //   kp_angular alto (8.0) → alinhamento ágil (sem "samba" de orientação).
+        //   arrival_threshold pequeno (0.02) → não para longe do alvo.
+        //   stop_on_arrival = false → loop contínuo: nunca para de monitorar.
+        GoToPositionParams p;
+        p.kp_linear         = 5.0;
+        p.kp_angular        = 8.0;
+        p.arrival_threshold = 0.02;
+        p.max_linear_speed  = 2.2;
+        p.stop_on_arrival   = false;
+        skill_ = std::make_unique<GoToPositionSkill>(0.0, 0.0, 1e9, p);
+    }
+
     std::string name() const override { return "DefendGoalTactic"; }
 
     bool isFinished() const override { return false; }  // nunca termina
@@ -52,20 +76,35 @@ public:
         double max_y = ctx.field.goal_width / 2.0 - 0.04;
         target_y = std::clamp(target_y, -max_y, max_y);
 
-        // Vai para posição de defesa
-        GoToPositionSkill gtp(goal_x, target_y);
-        return gtp.execute(robot, ctx);
+        // Atualiza apenas o alvo — last_v_ da skill é preservado entre frames
+        skill_->setTarget(goal_x, target_y);
+        return skill_->execute(robot, ctx);
     }
+
+private:
+    // [FIX] Skill persistente: last_v_ não é mais zerada a cada tick.
+    std::unique_ptr<GoToPositionSkill> skill_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DefendAreaTactic  —  usada pelo DefenderAreaRoleVSS
 //  Lógica: defensor se posiciona entre a bola e o nosso gol.
+//
+//  [FIX REGRESSÃO] Mesmo padrão da DefendGoalTactic: skill persistente
+//  para preservar last_v_ entre frames e não recomecar a rampa a cada tick.
 // ─────────────────────────────────────────────────────────────────────────────
 class DefendAreaTactic final : public Tactic {
 public:
     explicit DefendAreaTactic(int num_defenders = 0)
-        : num_defenders_(num_defenders) {}
+        : num_defenders_(num_defenders) {
+        GoToPositionParams p;
+        p.kp_linear         = 4.0;
+        p.kp_angular        = 6.0;
+        p.arrival_threshold = 0.04;
+        p.max_linear_speed  = 2.2;
+        p.stop_on_arrival   = false;
+        skill_ = std::make_unique<GoToPositionSkill>(0.0, 0.0, 1e9, p);
+    }
 
     std::string name() const override { return "DefendAreaTactic"; }
     bool isFinished() const override { return false; }
@@ -95,12 +134,13 @@ public:
                                ctx.field.min_y() + 0.08,
                                ctx.field.max_y() - 0.08);
 
-        GoToPositionSkill gtp(target_x, target_y);
-        return gtp.execute(robot, ctx);
+        skill_->setTarget(target_x, target_y);
+        return skill_->execute(robot, ctx);
     }
 
 private:
     int num_defenders_;
+    std::unique_ptr<GoToPositionSkill> skill_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,51 +247,86 @@ public:
 // ─────────────────────────────────────────────────────────────────────────────
 //  SupportPositionTactic  —  zagueiro se posiciona a meio-campo em apoio
 //
-//  Em vez de perseguir a bola (causando fogo amigo), o zagueiro/suporte
-//  se posiciona estrategicamente entre a bola e o nosso gol,
-//  pronto para defender mas também para receber a bola.
+//  [FIX REGRESSÃO] Skill persistente para evitar reset de last_v_ a cada
+//  frame. Além disso, corrigido o branch "ball_relative_x >= 0" para
+//  incluir a bola no meio-campo na fase ofensiva.
+// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  SupportPositionTactic  —  zagueiro ofensivo se posiciona em apoio
+//
+//  LÓGICA NOVA (reestruturada):
+//
+//  Eixo X:  target_x = ball.x − attack_dir × 0.40
+//    → Suporte fica SEMPRE 40 cm atrás da linha da bola no eixo de ataque.
+//    → Clamp mínimo: nunca fica atrás da posição −0.45 m (perto do nosso gol)
+//    → Clamp máximo: nunca ultrapassa 20 cm além da bola no campo ofensivo
+//      (evita chegar perto do atacante)
+//
+//  Eixo Y:  target_y = ball.y × 0.5
+//    → Espelha a bola com ganho 0.5: se bola em Y=0.30, suporte fica Y=0.15
+//    → Posiciona para rebote sem cruzar o caminho do atacante
+//    → Clamp: mínimo 20 cm das paredes laterais
+//
+//  [FIX REINSTANCIAÇÃO] skill_ é membro persistente — last_v_ nunca é
+//  zerado entre frames. Antes, SupportAttackerRoleVSS::selectTactic()
+//  chamava make_shared<SupportPositionTactic>() a CADA frame (60x/s),
+//  destruindo a skill e reiniciando a rampa do zero.
 // ─────────────────────────────────────────────────────────────────────────────
 class SupportPositionTactic final : public Tactic {
 public:
+    SupportPositionTactic() {
+        GoToPositionParams p;
+        p.kp_linear         = 4.0;
+        p.kp_angular        = 6.0;
+        p.arrival_threshold = 0.04;  // menor: o suporte deve rastrear a bola
+        p.max_linear_speed  = 2.0;
+        p.stop_on_arrival   = false; // loop contínuo: sempre segue a bola
+        skill_ = std::make_unique<GoToPositionSkill>(0.0, 0.0, 1e9, p);
+    }
+
     std::string name() const override { return "SupportPositionTactic"; }
     bool isFinished() const override { return false; }
 
     RobotCommand execute(const RobotState& robot,
                          const GameContext& ctx) override
     {
-        double target_x, target_y;
+        // ── Eixo X: 40 cm atrás da bola no eixo de ataque ────────────────
+        //   attack_dir > 0: gol adversário em +X, "atrás" = menos X
+        //   attack_dir < 0: gol adversário em -X, "atrás" = mais X
+        double target_x = ctx.ball.x - ctx.attack_dir * 0.40;
 
-        // attack_dir = 1 (atacando para X positivo), -1 (atacando para X negativo)
-        // Se ball_relative_x > 0, bola está no meio-campo ofensivo.
-        double ball_relative_x = ctx.ball.x * ctx.attack_dir;
+        // Clamp X — O suporte NÃO pode sair do campo nem entrar na
+        // nossa área de gol. Limite mínimo: −0.45 m da origem
+        // (campo vai até ±0.75 m; área do goleiro começa em ±0.60 m)
+        const double x_min_safe = -ctx.attack_dir * 0.45;  // nosso lado
+        const double x_max_safe =  ctx.attack_dir * (ctx.field.max_x() - 0.10);
 
-        if (ball_relative_x > 0.0) {
-            // ── FASE OFENSIVA ─────────────────────────────────────────────────
-            // Posiciona-se na intermediária (meio do campo ou um pouco avançado)
-            target_x = ctx.attack_dir * 0.10; // Pouco além do meio-campo
-            
-            // Fica no lado oposto (fraco) para receber sobras/cruzamentos
-            double lateral_offset = (ctx.ball.y > 0.0) ? -0.25 : 0.25;
-            target_y = ctx.ball.y + lateral_offset;
+        if (ctx.attack_dir > 0) {
+            // Atacamos para +X: x_min_safe é negativo (nosso lado)
+            target_x = std::clamp(target_x, x_min_safe, x_max_safe);
         } else {
-            // ── FASE DEFENSIVA ────────────────────────────────────────────────
-            // Arma parede defensiva logo à frente da nossa área
-            double our_area_front = -ctx.attack_dir * (ctx.field.max_x() - ctx.field.area_length);
-            target_x = our_area_front + ctx.attack_dir * 0.12; // 12cm à frente da área
-            
-            // Bloqueia a linha de passe, acompanhando a bola em Y
-            // Escala ligeiramente para não abrir tanto o meio
-            target_y = ctx.ball.y * 0.85;
+            // Atacamos para -X: x_min_safe é positivo
+            target_x = std::clamp(target_x, x_max_safe, x_min_safe);
         }
 
-        // Clamp no eixo Y para evitar colar nas paredes laterais do campo
-        target_y = std::clamp(target_y,
-                               ctx.field.min_y() + 0.12,
-                               ctx.field.max_y() - 0.12);
+        // ── Eixo Y: espelha a bola com ganho 0.5 ─────────────────────────
+        //   Bola em Y=0.30 → suporte fica em Y=0.15 (lado do rebote)
+        //   Bola em Y=0.00 → suporte fica em Y=0.00 (centro)
+        double target_y = ctx.ball.y * 0.5;
 
-        GoToPositionSkill gtp(target_x, target_y);
-        return gtp.execute(robot, ctx);
+        // Clamp Y: mínimo 20 cm das paredes laterais
+        target_y = std::clamp(target_y,
+                               ctx.field.min_y() + 0.20,
+                               ctx.field.max_y() - 0.20);
+
+        // Skill persistente: last_v_ preservado entre frames
+        skill_->setTarget(target_x, target_y);
+        return skill_->execute(robot, ctx);
     }
+
+private:
+    // Skill persistente: last_v_ NÃO é zerada entre frames
+    std::unique_ptr<GoToPositionSkill> skill_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,29 +366,46 @@ public:
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KeeperRoleVSS
+//
+//  [FIX C3] tactic_ é membro persistente: a DefendGoalTactic (e sua
+//  GoToPositionSkill interna) sobrevivem entre frames, preservando last_v_.
+//  Antes: make_shared<DefendGoalTactic>() a cada selectTactic() → last_v_
+//  zerado 60x/s → goleiro nunca acelerava ("câmera lenta").
 // ─────────────────────────────────────────────────────────────────────────────
 class KeeperRoleVSS final : public Role {
 public:
-    explicit KeeperRoleVSS(uint8_t id) : Role(id) {}
+    explicit KeeperRoleVSS(uint8_t id)
+        : Role(id)
+        , tactic_(std::make_shared<DefendGoalTactic>())
+    {}
     std::string name() const override { return "KeeperRoleVSS"; }
 
 protected:
-    // LabVIEW: sempre DefendGoalTactic, sem condições de troca
     std::shared_ptr<Tactic> selectTactic(const RobotState& robot,
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        return std::make_shared<DefendGoalTactic>();
+        return tactic_;  // sempre o mesmo objeto — last_v_ preservado entre frames
     }
+
+private:
+    std::shared_ptr<DefendGoalTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DefenderAreaRoleVSS
+//
+//  [FIX C3] Mesmo padrão do KeeperRoleVSS: tactic_ persistente.
+//  num_defenders_ é fixo por Role (definido pela Play na criação) — a tática
+//  é construída uma única vez com esse valor e reutilizada em todos os frames.
 // ─────────────────────────────────────────────────────────────────────────────
 class DefenderAreaRoleVSS final : public Role {
 public:
     explicit DefenderAreaRoleVSS(uint8_t id, int num_defenders = 0)
-        : Role(id), num_defenders_(num_defenders) {}
+        : Role(id)
+        , num_defenders_(num_defenders)
+        , tactic_(std::make_shared<DefendAreaTactic>(num_defenders))
+    {}
 
     std::string name() const override { return "DefenderAreaRoleVSS"; }
 
@@ -322,23 +414,29 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        return std::make_shared<DefendAreaTactic>(num_defenders_);
+        return tactic_;  // sempre o mesmo objeto — last_v_ preservado entre frames
     }
 
 private:
     int num_defenders_;
+    std::shared_ptr<DefendAreaTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  NormalAttackerRoleVSS
 //
-//  CORRIGIDO: Atacante agressivo que vai direto na bola e entra na área.
-//  Usa AggressivePushTactic para não ser bloqueado pela proteção de área.
-//  A atribuição de papel (atacante) é feita pelo Play baseado em distância.
+//  [FIX C4] tactic_ persistente: preserva last_v_, stuck_frames_,
+//  is_unsticking_ e unstick_frames_ da VectorAttackerSkill interna.
+//  Antes: make_shared<VectorAttackTactic>() a cada selectTactic() zeravam
+//  todos esses contadores 60x/s — o Unstick Detector nunca disparava e
+//  o atacante nunca atingia velocidade de cruzeiro.
 // ─────────────────────────────────────────────────────────────────────────────
 class NormalAttackerRoleVSS final : public Role {
 public:
-    explicit NormalAttackerRoleVSS(uint8_t id) : Role(id) {}
+    explicit NormalAttackerRoleVSS(uint8_t id)
+        : Role(id)
+        , tactic_(std::make_shared<VectorAttackTactic>())
+    {}
     std::string name() const override { return "NormalAttackerRoleVSS"; }
 
 protected:
@@ -346,9 +444,11 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        // Nova Lógica: usa a máquina de estados orientada a vetores (BYPASS -> ALIGN -> PUSH)
-        return std::make_shared<VectorAttackTactic>();
+        return tactic_;  // sempre o mesmo objeto — estado da VectorAttackerSkill preservado
     }
+
+private:
+    std::shared_ptr<VectorAttackTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,9 +459,26 @@ protected:
 //  este robô se posiciona estrategicamente para receber passes e cobrir
 //  o espaço. Evita o "fogo amigo" onde dois robôs vão na mesma bola.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  SupportAttackerRoleVSS
+//
+//  [FIX CRÍTICO] Bug de reinstanciação corrigido.
+//
+//  O padrão anterior: selectTactic() retornava make_shared<SupportPositionTactic>()
+//  a cada chamada. Como Role::execute() chama selectTactic() a cada frame (60Hz),
+//  a SupportPositionTactic (e sua skill interna GoToPositionSkill) eram destruídas
+//  e recriadas 60 vezes por segundo. O last_v_ da skill era zerado a cada ciclo,
+//  reiniciando a rampa trapezoidal do zero — o robô nunca acelerava.
+//
+//  Correção: tactic_ é membro persistente, instanciada apenas uma vez no
+//  construtor. selectTactic() retorna sempre o mesmo objeto compartilhado.
+// ─────────────────────────────────────────────────────────────────────────────
 class SupportAttackerRoleVSS final : public Role {
 public:
-    explicit SupportAttackerRoleVSS(uint8_t id) : Role(id) {}
+    explicit SupportAttackerRoleVSS(uint8_t id)
+        : Role(id)
+        , tactic_(std::make_shared<SupportPositionTactic>())
+    {}
     std::string name() const override { return "SupportAttackerRoleVSS"; }
 
 protected:
@@ -369,8 +486,14 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        return std::make_shared<SupportPositionTactic>();
+        // Retorna SEMPRE o mesmo objeto — tactic_ e sua skill_ internas
+        // nunca são destruídas, preservando last_v_ entre todos os frames.
+        return tactic_;
     }
+
+private:
+    // Tática persistente: criada uma vez, reutilizada durante toda a vida do Role
+    std::shared_ptr<SupportPositionTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -379,33 +502,60 @@ protected:
 //  Atacante que mira o gol antes de chutar.
 //  Diferença do NormalAttacker: adiciona fase de alinhamento explícita.
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  AimGoalTactic  —  Tática de ataque ao gol com posicionamento orbital
+//
+//  REESCRITA COMPLETA. O encadeamento antigo
+//    AggressiveGoToBallSkill → RotateToAngleSkill → KickSkill
+//  causava visão de túnel: o robô ia direto à bola, ficava preso em cima
+//  dela e nunca chegava ao KickSkill.
+//
+//  NOVA LÓGICA: Uma única OrbitAttackerSkill persistente (skill_ é membro),
+//  com máquina de estados interna:
+//    ORBIT → APPROACH → PUSH
+//  O robô NUNCA vai direto à bola. Sempre navega para target_behind_ball
+//  (12 cm atrás da bola no eixo gol→bola) antes de empurrar.
+//
+//  [FIX REINSTANCIAÇÃO] skill_ é membro desta tática — não é recriada a
+//  cada frame. A tática em si também é armazenada de forma persistente em
+//  AttackerAimGoalRoleVSS (ver abaixo).
+// ─────────────────────────────────────────────────────────────────────────────
 class AimGoalTactic final : public Tactic {
 public:
     std::string name() const override { return "AimGoalTactic"; }
-    bool isFinished() const override { return false; }
+    bool isFinished() const override { return false; }  // loop contínuo
 
     AimGoalTactic() {
-        addSkill<AggressiveGoToBallSkill>();
-        addSkill<RotateToAngleSkill>(RotateToAngleSkill::towardGoal());
-        addSkill<KickSkill>();
+        // OrbitAttackerSkill encapsula toda a lógica ORBIT→APPROACH→PUSH
+        // incluindo Tridente, Unstick e histerese de estado
+        skill_ = std::make_unique<OrbitAttackerSkill>();
+    }
+
+    void init(const RobotState& robot, const GameContext& ctx) override {
+        Tactic::init(robot, ctx);
+        skill_->init(robot, ctx);
     }
 
     RobotCommand execute(const RobotState& robot,
                          const GameContext& ctx) override
     {
-        auto cmd = Tactic::execute(robot, ctx);
-        if (tactic_finished_) {
-            tactic_finished_   = false;
-            current_skill_idx_ = 0;
-            skills_[0]->init(robot, ctx);
-        }
-        return cmd;
+        // Delega diretamente: a OrbitAttackerSkill é a única skill e é persistente
+        return skill_->execute(robot, ctx);
     }
+
+private:
+    std::unique_ptr<OrbitAttackerSkill> skill_;
 };
 
+// [FIX REINSTANCIAÇÃO] Mesmo padrão aplicado ao AttackerAimGoalRoleVSS:
+// tactic_ persistente para preservar o estado ORBIT/APPROACH/PUSH da
+// OrbitAttackerSkill entre frames.
 class AttackerAimGoalRoleVSS final : public Role {
 public:
-    explicit AttackerAimGoalRoleVSS(uint8_t id) : Role(id) {}
+    explicit AttackerAimGoalRoleVSS(uint8_t id)
+        : Role(id)
+        , tactic_(std::make_shared<AimGoalTactic>())
+    {}
     std::string name() const override { return "AttackerAimGoalRoleVSS"; }
 
 protected:
@@ -413,8 +563,11 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        return std::make_shared<AimGoalTactic>();
+        return tactic_;  // Sempre o mesmo objeto — estado da máquina preservado
     }
+
+private:
+    std::shared_ptr<AimGoalTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -422,10 +575,17 @@ protected:
 //
 //  Atacante agressivo: sempre vai para a bola independente de distância.
 //  Usado quando o time precisa pressionar.
+//
+//  [FIX C3] tactic_ persistente: mesmo problema e mesma solução do
+//  NormalAttackerRoleVSS. VectorAttackerSkill precisa sobreviver entre
+//  frames para que stuck_frames_ acumule e o Unstick dispare.
 // ─────────────────────────────────────────────────────────────────────────────
 class BallChallengerAttackerRoleVSS final : public Role {
 public:
-    explicit BallChallengerAttackerRoleVSS(uint8_t id) : Role(id) {}
+    explicit BallChallengerAttackerRoleVSS(uint8_t id)
+        : Role(id)
+        , tactic_(std::make_shared<VectorAttackTactic>())
+    {}
     std::string name() const override { return "BallChallengerAttackerRoleVSS"; }
 
 protected:
@@ -433,9 +593,11 @@ protected:
                                           const GameContext& ctx) override
     {
         (void)robot; (void)ctx;
-        // Nova Lógica: atacante desafiante usa o ataque vetorial unificado
-        return std::make_shared<VectorAttackTactic>();
+        return tactic_;  // sempre o mesmo objeto — estado da VectorAttackerSkill preservado
     }
+
+private:
+    std::shared_ptr<VectorAttackTactic> tactic_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

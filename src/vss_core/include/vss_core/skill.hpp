@@ -165,6 +165,11 @@ protected:
     // ─────────────────────────────────────────────────────────────────────────
     //  avoidCollisions — frenagem linear por proximidade de robôs e paredes
     //  (escala a velocidade linear, não altera a direção)
+    //
+    //  [CORRIGIDO Bug #1C] Cone de detecção ampliado de M_PI/4 (45°) para
+    //  M_PI/3 (60°). Robôs VSS são cubos de 7.5×7.5 cm com quinas vivas —
+    //  colisões em ângulos laterais (45°–90°) não ativavam a frenagem antes,
+    //  impedindo o contador stuck_frames_ de acumular e o Unstick de disparar.
     // ─────────────────────────────────────────────────────────────────────────
     double avoidCollisions(const RobotState& robot, const GameContext& ctx, double v) const {
         // Robôs aliados
@@ -174,8 +179,10 @@ protected:
             double dist = std::hypot(dx, dy);
             if (dist < 0.13) {
                 double ang_diff = std::abs(normalizeAngle(std::atan2(dy, dx) - robot.theta));
-                if (ang_diff < M_PI / 4.0) {
-                    double scale = (dist - 0.075) / (0.13 - 0.075);
+                // [Bug #1C] Era M_PI/4 (45°) — colisões de quina em 45-90° passavam sem frear.
+                // Ampliado para M_PI/3 (60°) para cobrir a geometria real do cubo.
+                if (ang_diff < M_PI / 3.0) {
+                    double scale = (dist - 0.076) / (0.13 - 0.076);
                     v *= std::clamp(scale, 0.0, 1.0);
                 }
             }
@@ -187,8 +194,9 @@ protected:
             double dist = std::hypot(dx, dy);
             if (dist < 0.13) {
                 double ang_diff = std::abs(normalizeAngle(std::atan2(dy, dx) - robot.theta));
-                if (ang_diff < M_PI / 4.0) {
-                    double scale = (dist - 0.075) / (0.13 - 0.075);
+                // [Bug #1C] Mesmo ajuste de cone para adversários.
+                if (ang_diff < M_PI / 3.0) {
+                    double scale = (dist - 0.076) / (0.13 - 0.076);
                     v *= std::clamp(scale, 0.0, 1.0);
                 }
             }
